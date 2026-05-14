@@ -274,23 +274,23 @@ def _run_analysis_in_thread(error_id: int, prompt: str):
 
         from run_agent import AIAgent
         from hermes_constants import get_hermes_home as _gh
-        from hermes_cli.config_loader import load_config as _load_cfg  # type: ignore
+        from hermes_cli.config import load_config as _load_cfg
+        from hermes_state import SessionDB
 
         push("status", "Loading config and creating agent...")
 
-        # Load config for model/provider/API key resolution
         cfg = _load_cfg()
-        model = (cfg.get("model") or {}).get("default", "deepseek-v4-pro")
-        provider = (cfg.get("model") or {}).get("provider", "opencode-go")
+        model = (cfg.get("model") or {}).get("default", "")
+        provider = (cfg.get("model") or {}).get("provider", "")
         base_url = (cfg.get("model") or {}).get("base_url", "")
         api_key = ""
-        # Try to resolve API key from credential pool or env
         try:
-            from agent.credential_pool import resolve_credential  # type: ignore
+            from agent.credential_pool import resolve_credential
             api_key = resolve_credential(provider, model) or ""
         except Exception:
             pass
 
+        session_db = SessionDB()
         agent = AIAgent(
             model=model,
             provider=provider,
@@ -302,6 +302,8 @@ def _run_analysis_in_thread(error_id: int, prompt: str):
             platform="cron",
             skip_memory=True,
             quiet_mode=True,
+            session_id="log-doctor-session",
+            session_db=session_db,
         )
 
         push("status", "Analyzing error...")
