@@ -10,11 +10,14 @@ import json
 import logging
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
+from queue import Queue
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 
 from hermes_constants import get_hermes_home
 
@@ -244,9 +247,70 @@ def api_apply_fix(error_id: int, dry_run: bool = False):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
+
+
+# Analysis streaming — per-error-id event queues for SSE
+_analysis_queues: dict[int, Queue] = {}
+_analysis_lock = threading.Lock()
+
+
+def _run_analysis_in_thread(error_id: int, prompt: str):
+    """Background thread: run agent analysis and push events to queue."""
+    q = _analysis_queues.get(error_id)
+    if not q:
+        return
+
+    def push(event_type: str, text: str = "", data: dict | None = None):
+        payload = {"type": event_type, "text": text}
+        if data:
+            payload.update(data)
+        q.put(payload)
+
+    try:
+        push("status", "Initializing analysis session...")
+
+        # Add Hermes agent path
+        sys.path.insert(0, str(_HERMES_AGENT_DIR))
+
+        from run_agent import AIAgent
+        from hermes_constants import get_hermes_home as _gh
+
+        push("status", "Loading config and creating agent...")
+
+        agent = AIAgent(
+            max_iterations=15,
+            enabled_toolsets=["terminal", "file", "skills"],
+            platform="cli",
+            skip_memory=False,
+        )
+
+        push("status", "Analyzing error...")
+        result = agent.run_conversation(prompt)
+
+        final_response = result.get("final_response", "") if isinstance(result, dict) else str(result)
+        push("status", "Analysis complete, storing fix...")
+
+        # Store the fix in the database
+        conn = _get_db()
+        try:
+            from db import set_fix as _sf
+            _sf(conn, error_id, final_response[:2000], "")
+            conn.commit()
+        finally:
+            pass
+
+        push("done", final_response[:2000], {"fix_stored": True})
+        push("status", "✓ Analysis complete. Result stored.")
+
+    except Exception as exc:
+        push("error", f"Analysis failed: {exc}")
+    finally:
+        q.put(None)  # Sentinel to close SSE
+
+
+
 @router.post("/errors/{error_id}/analyze")
-def api_analyze_with_agent(error_id: int):
-    """Run agent analysis via a one-shot cron job. Returns job_id for polling."""
+def api_start_analysis(error_id: int):
     conn = _get_db()
     try:
         record = conn.execute(
@@ -257,7 +321,7 @@ def api_analyze_with_agent(error_id: int):
         r = dict(record)
 
         prompt = (
-            f"You are a Log Doctor analysis agent. Analyze this error and call suggest_error_fix to store your diagnosis.\n\n"
+            f"You are a Log Doctor analysis agent. Analyze this Hermes log error and call suggest_error_fix to store your diagnosis.\n\n"
             f"Error ID: {error_id}\n"
             f"Error Type: {r['error_type']}\n"
             f"Message: {r['message']}\n"
@@ -273,36 +337,23 @@ def api_analyze_with_agent(error_id: int):
             f"Be concise. Only output your diagnosis and then call suggest_error_fix."
         )
 
-        name = f"log-doctor-analysis-{error_id}"
+        # Cancel any existing analysis for this error
+        with _analysis_lock:
+            old_q = _analysis_queues.pop(error_id, None)
+            if old_q:
+                old_q.put(None)  # Close old SSE
 
-        # Create a one-shot cron job that runs immediately
-        import sys
-        sys.path.insert(0, str(_HERMES_AGENT_DIR))
-        from cron.jobs import create_job
-
-        job = create_job(
-            prompt=prompt,
-            schedule=_now_iso(),  # run once immediately
-            name=name,
-            repeat=1,
-            deliver="local",
-            skills=["log-doctor"],
-            enabled_toolsets=["terminal", "file"],
-        )
-
-        # Store job_id in error record so frontend can poll
-        conn.execute(
-            "UPDATE error_entries SET fix_description = ?, fix_command = ? WHERE id = ?",
-            (f"__analysis_job__:{job['id']}", "", error_id),
-        )
-        conn.commit()
+        # Create queue and start thread
+        q = Queue()
+        _analysis_queues[error_id] = q
+        t = threading.Thread(target=_run_analysis_in_thread, args=(error_id, prompt), daemon=True)
+        t.start()
 
         return {
             "ok": True,
-            "analysis_queued": True,
+            "analysis_started": True,
             "error_id": error_id,
-            "job_id": job["id"],
-            "job_name": name,
+            "session": "log-doctor-session",
         }
     except HTTPException:
         raise
@@ -310,75 +361,37 @@ def api_analyze_with_agent(error_id: int):
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-@router.get("/errors/{error_id}/analysis-status")
-def api_analysis_status(error_id: int):
-    """Check if the analysis cron job has completed."""
-    conn = _get_db()
-    try:
-        record = conn.execute(
-            "SELECT * FROM error_entries WHERE id = ?", (error_id,)
-        ).fetchone()
-        if not record:
-            raise HTTPException(status_code=404, detail=f"Error {error_id} not found")
-        r = dict(record)
+@router.get("/errors/{error_id}/analyze-stream")
+async def api_analysis_stream(error_id: int):
+    """SSE endpoint — streams agent analysis events in real time."""
+    q = _analysis_queues.get(error_id)
+    if not q:
+        # Return a single-event stream saying no analysis running
+        async def _empty():
+            yield "data: " + json.dumps({"type": "error", "text": "No analysis in progress"}) + "\n\n"
+        return StreamingResponse(_empty(), media_type="text/event-stream")
 
-        # Check if fix_description contains our job marker
-        fd = r.get("fix_description") or ""
-        if fd.startswith("__analysis_job__:"):
-            job_id = fd.split(":", 1)[1]
-            import sys
-            sys.path.insert(0, str(_HERMES_AGENT_DIR))
-            from cron.jobs import load_jobs
+    async def _stream():
+        while True:
+            try:
+                event = q.get(timeout=1)
+            except Exception:
+                # Send keepalive
+                yield ": keepalive\n\n"
+                continue
 
-            jobs = load_jobs()
-            job = next((j for j in jobs.get("jobs", []) if j["id"] == job_id), None)
+            if event is None:
+                yield "data: " + json.dumps({"type": "closed"}) + "\n\n"
+                break
 
-            if not job:
-                return {"ok": True, "status": "unknown", "error_id": error_id}
+            yield "data: " + json.dumps(event) + "\n\n"
 
-            status = job.get("last_status", "pending")
-            if status == "ok":
-                # Job completed — check if fix was actually stored
-                if r.get("fix_description") and not r["fix_description"].startswith("__analysis_job__:"):
-                    return {
-                        "ok": True,
-                        "status": "completed",
-                        "error_id": error_id,
-                        "fix_description": r["fix_description"],
-                        "fix_command": r["fix_command"],
-                    }
-                else:
-                    return {
-                        "ok": True,
-                        "status": "completed_no_fix",
-                        "error_id": error_id,
-                        "message": "Analysis completed but no fix was suggested.",
-                    }
-            elif status in ("error", "failed"):
-                return {
-                    "ok": True,
-                    "status": "failed",
-                    "error_id": error_id,
-                    "error": job.get("last_error", "Unknown error"),
-                }
-            else:
-                return {"ok": True, "status": "running", "error_id": error_id}
+            if event.get("type") in ("done", "error"):
+                # Allow a final read then close
+                yield "data: " + json.dumps({"type": "closed"}) + "\n\n"
+                break
 
-        # No analysis job marker — check if fix already exists
-        if r.get("fix_description"):
-            return {
-                "ok": True,
-                "status": "completed",
-                "error_id": error_id,
-                "fix_description": r["fix_description"],
-                "fix_command": r["fix_command"],
-            }
-
-        return {"ok": True, "status": "not_started", "error_id": error_id}
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
+    return StreamingResponse(_stream(), media_type="text/event-stream")
 
 
 # ---------------------------------------------------------------------------

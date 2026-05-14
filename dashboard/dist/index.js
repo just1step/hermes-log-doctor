@@ -131,46 +131,74 @@
       });
     }
     function doAnalyze(id) {
-      setAnalysisState(Object.assign({}, analysisState, {[id]: 'running'}));
+      setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'running', text: 'Starting...', fullText: '' }}));
       apiPost('/errors/' + id + '/analyze').then(function (data) {
-        if (data.analysis_queued) {
-          setFlashMsg({ text: 'Agent analysis started...', type: 'success' });
-          pollAnalysis(id);
+        if (data.analysis_started) {
+          setFlashMsg({ text: 'Agent analysis started — log-doctor-session', type: 'success' });
+          streamAnalysis(id);
         } else {
-          setAnalysisState(Object.assign({}, analysisState, {[id]: 'failed'}));
+          setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'failed', text: 'Failed to start' }}));
         }
       }).catch(function (e) {
         setFlashMsg({ text: e.message, type: 'error' });
-        setAnalysisState(Object.assign({}, analysisState, {[id]: 'failed'}));
+        setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'failed', text: e.message }}));
       });
     }
 
-    function pollAnalysis(id) {
-      setTimeout(function () {
-        apiGet('/errors/' + id + '/analysis-status').then(function (data) {
-          if (data.status === 'completed') {
-            setAnalysisState(Object.assign({}, analysisState, {[id]: {
-              status: 'done',
-              fix_description: data.fix_description,
-              fix_command: data.fix_command
-            }}));
-            setFlashMsg({ text: 'Analysis complete!', type: 'success' });
-            loadErrors(activeTab);
-          } else if (data.status === 'failed') {
-            setAnalysisState(Object.assign({}, analysisState, {[id]: {status: 'failed', error: data.error}}));
-            setFlashMsg({ text: 'Analysis failed: ' + (data.error || 'unknown'), type: 'error' });
-          } else if (data.status === 'completed_no_fix') {
-            setAnalysisState(Object.assign({}, analysisState, {[id]: {status: 'done_no_fix', message: data.message}}));
-            setFlashMsg({ text: 'Analysis done but no fix suggested.', type: 'success' });
-            loadErrors(activeTab);
-          } else {
-            // Still running, poll again
-            pollAnalysis(id);
-          }
-        }).catch(function () {
-          pollAnalysis(id); // Retry on network error
-        });
-      }, 2000);
+    function streamAnalysis(id) {
+      var url = API_BASE + '/errors/' + id + '/analyze-stream';
+      var token = window.__HERMES_SESSION_TOKEN__ || '';
+      // Use fetch with streaming for SSE
+      fetch(url, { headers: token ? { 'Authorization': 'Bearer ' + token } : {} }).then(function (response) {
+        if (!response.ok) throw new Error('SSE connection failed');
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+
+        function read() {
+          reader.read().then(function (result) {
+            if (result.done) return;
+            buffer += decoder.decode(result.value, { stream: true });
+            // Parse SSE frames
+            var lines = buffer.split('\n');
+            buffer = lines.pop() || ''; // Keep incomplete line
+            for (var i = 0; i < lines.length; i++) {
+              var line = lines[i];
+              if (!line.startsWith('data: ')) continue;
+              try {
+                var evt = JSON.parse(line.slice(6));
+                var as = analysisState;
+                var cur = __getAnalysisState(id);
+                if (evt.type === 'status') {
+                  __setAnalysisState(id, { status: 'running', text: evt.text, fullText: (cur.fullText || '') + evt.text + '\n' });
+                } else if (evt.type === 'done') {
+                  __setAnalysisState(id, { status: 'done', text: evt.text, fullText: (cur.fullText || '') + evt.text + '\n', fix_stored: evt.fix_stored });
+                  setFlashMsg({ text: 'Analysis complete!', type: 'success' });
+                  loadErrors(activeTab);
+                } else if (evt.type === 'error') {
+                  __setAnalysisState(id, { status: 'failed', text: evt.text, fullText: (cur.fullText || '') + evt.text + '\n' });
+                  setFlashMsg({ text: evt.text, type: 'error' });
+                } else if (evt.type === 'closed') {
+                  // Stream ended
+                }
+              } catch (e) {}
+            }
+            read();
+          }).catch(function () {});
+        }
+        read();
+      }).catch(function (e) {
+        console.error('[log-doctor] SSE error:', e);
+        setFlashMsg({ text: 'Stream connection failed', type: 'error' });
+      });
+    }
+
+    // Helper to get/set analysis state bypassing React batching for streaming
+    var _analysisStateCache = {};
+    function __getAnalysisState(id) { return _analysisStateCache[id] || analysisState[id] || {}; }
+    function __setAnalysisState(id, value) {
+      _analysisStateCache[id] = value;
+      setAnalysisState(Object.assign({}, analysisState, _analysisStateCache));
     }
 
     function tabClass(name) {
@@ -267,7 +295,10 @@
               (function () {
                 var as = analysisState[e.id];
                 if (!as) return null;
-                if (as === 'running') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(122,162,247,0.1)', border: '1px solid #7aa2f7', color: '#7aa2f7', fontSize: '12px' } }, '\u23F3 Agent analyzing this error...');
+                if (as.status === 'running') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: '#1a1b26', border: '1px solid #414868', fontSize: '12px', fontFamily: 'monospace', maxHeight: '400px', overflowY: 'auto', whiteSpace: 'pre-wrap', color: '#c0caf5' } },
+                  h('div', { style: { color: '#7aa2f7', marginBottom: '6px' } }, '\u23F3 Agent Analysis — log-doctor-session'),
+                  as.fullText || as.text || 'Initializing...'
+                );
                 if (as.status === 'done') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
                   h('div', { style: { color: '#9ece6a', fontWeight: 'bold', marginBottom: '4px' } }, '\u2705 Agent Analysis'),
                   h('div', { style: { color: '#c0caf5', marginBottom: '4px' } }, as.fix_description),
@@ -280,7 +311,7 @@
               })(),
               h('div', { style: style.actions },
                 e.status === 'active' && !analysisState[e.id] && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doAnalyze(e.id); } }, 'Ask Agent'),
-                e.status === 'active' && analysisState[e.id] !== 'running' && e.fix_command && h('button', { style: style.btnFix, onClick: function (ev) { ev.stopPropagation(); doFix(e.id); } }, 'Apply Fix'),
+                e.status === 'active' && analysisState[e.id] && analysisState[e.id].status !== 'running' && e.fix_command && h('button', { style: style.btnFix, onClick: function (ev) { ev.stopPropagation(); doFix(e.id); } }, 'Apply Fix'),
                 e.status === 'active' && h('button', { style: style.btnIgnore, onClick: function (ev) { ev.stopPropagation(); doIgnore(e.id); } }, 'Ignore'),
                 e.status === 'ignored' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doUnignore(e.id); } }, 'Un-ignore')
               ),
