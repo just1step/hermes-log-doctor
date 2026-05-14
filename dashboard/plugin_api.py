@@ -344,20 +344,25 @@ def api_start_analysis(error_id: int):
         r = dict(record)
 
         prompt = (
-            f"You are a Log Doctor analysis agent. Analyze this Hermes log error and call suggest_error_fix to store your diagnosis.\n\n"
-            f"Error ID: {error_id}\n"
-            f"Error Type: {r['error_type']}\n"
-            f"Message: {r['message']}\n"
-            f"Occurrences: {r['count']} times (first: {r['first_seen']}, last: {r['last_seen']})\n"
-            f"Source: {r['source']}\n"
-            f"Context: {r.get('context', 'N/A')[:500]}\n\n"
-            f"Steps:\n"
-            f"1. Call analyze_log_error(error_id={error_id}) to get full details\n"
-            f"2. Diagnose the root cause\n"
-            f"3. Call suggest_error_fix(error_id={error_id}, description=\"...\", command=\"...\")\n"
-            f"   - description: human-readable root cause and fix explanation\n"
-            f"   - command: shell command to apply the fix (or empty string if manual)\n\n"
-            f"Be concise. Only output your diagnosis and then call suggest_error_fix."
+            f"You are a Log Doctor analysis agent. Your ONLY job is to diagnose errors and record findings.\\n\\n"
+            f"**CRITICAL RULES:**\\n"
+            f"- You MUST NOT execute any fix or modify any file/system.\\n"
+            f"- You MUST NOT use terminal, patch, write_file, or any tool that changes state.\\n"
+            f"- Your ONLY allowed actions: read tools (analyze_log_error) + suggest_error_fix.\\n"
+            f"- If a fix requires a shell command, describe it in suggest_error_fix — do NOT run it.\\n\\n"
+            f"Error ID: {error_id}\\n"
+            f"Error Type: {r['error_type']}\\n"
+            f"Message: {r['message']}\\n"
+            f"Occurrences: {r['count']} times (first: {r['first_seen']}, last: {r['last_seen']})\\n"
+            f"Source: {r['source']}\\n"
+            f"Context: {r.get('context', 'N/A')[:500]}\\n\\n"
+            f"Steps:\\n"
+            f"1. Call analyze_log_error(error_id={error_id}) to get full details\\n"
+            f"2. Diagnose the root cause\\n"
+            f"3. Call suggest_error_fix(error_id={error_id}, description=\\\"...\\\", command=\\\"...\\\")\\n"
+            f"   - description: human-readable root cause and fix explanation\\n"
+            f"   - command: shell command to apply the fix (or empty string if manual)\\n\\n"
+            f"Be concise. Do not execute anything — only diagnose and record."
         )
 
         # Cancel any existing analysis for this error
@@ -415,6 +420,38 @@ async def api_analysis_stream(error_id: int):
                 break
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+@router.get("/errors/{error_id}/analysis-status")
+def api_analysis_status(error_id: int):
+    """Check analysis status — used for polling."""
+    conn = _get_db()
+    try:
+        record = conn.execute(
+            "SELECT * FROM error_entries WHERE id = ?", (error_id,)
+        ).fetchone()
+        if not record:
+            raise HTTPException(status_code=404, detail=f"Error {error_id} not found")
+        r = dict(record)
+        fd = r.get("fix_description") or ""
+
+        # Check if analysis thread is still running
+        q = _analysis_queues.get(error_id)
+        if q and not q.empty():
+            return {"ok": True, "status": "running", "error_id": error_id}
+
+        # Check if fix was stored
+        if fd and not fd.startswith("__analysis_job__:"):
+            return {
+                "ok": True, "status": "completed", "error_id": error_id,
+                "fix_description": fd, "fix_command": r.get("fix_command") or "",
+            }
+
+        return {"ok": True, "status": "running", "error_id": error_id}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------

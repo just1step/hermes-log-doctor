@@ -67,6 +67,8 @@
     var typeFilter = _ref8[0], setTypeFilter = _ref8[1];
     var _ref9 = useState({});
     var analysisState = _ref9[0], setAnalysisState = _ref9[1];
+    var _ref10 = useState(false);
+    var analysisRunning = _ref10[0], setAnalysisRunning = _ref10[1];
 
     useEffect(function () {
       loadErrors(activeTab);
@@ -141,66 +143,54 @@
       });
     }
     function doAnalyze(id) {
-      setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'running', text: 'Starting...', fullText: '' }}));
+      if (analysisRunning) { setFlashMsg({ text: 'Another analysis is already running. Please wait.', type: 'error' }); return; }
+      setAnalysisRunning(true);
+      setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'running', text: 'Agent starting...', fullText: 'Agent starting...' }}));
+      // Progress dots: cycle 1-5 dots, single line, no accumulation
+      var dots = 0;
+      var timer = setInterval(function () {
+        dots = (dots % 5) + 1;
+        var msg = 'Agent analyzing' + '.'.repeat(dots);
+        __setAnalysisState(id, { status: 'running', text: msg, fullText: msg });
+      }, 600);
+
       apiPost('/errors/' + id + '/analyze').then(function (data) {
         if (data.analysis_started) {
           setFlashMsg({ text: 'Agent analysis started — log-doctor-session', type: 'success' });
-          streamAnalysis(id);
+          pollAnalysisResult(id, timer);
         } else {
+          clearInterval(timer);
           setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'failed', text: 'Failed to start' }}));
         }
       }).catch(function (e) {
+        clearInterval(timer);
         setFlashMsg({ text: e.message, type: 'error' });
         setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'failed', text: e.message }}));
       });
     }
 
-    function streamAnalysis(id) {
-      var url = API_BASE + '/errors/' + id + '/analyze-stream';
-      var token = window.__HERMES_SESSION_TOKEN__ || '';
-      // Use fetch with streaming for SSE
-      fetch(url, { headers: token ? { 'Authorization': 'Bearer ' + token } : {} }).then(function (response) {
-        if (!response.ok) throw new Error('SSE connection failed');
-        var reader = response.body.getReader();
-        var decoder = new TextDecoder();
-        var buffer = '';
-
-        function read() {
-          reader.read().then(function (result) {
-            if (result.done) return;
-            buffer += decoder.decode(result.value, { stream: true });
-            // Parse SSE frames
-            var lines = buffer.split('\n');
-            buffer = lines.pop() || ''; // Keep incomplete line
-            for (var i = 0; i < lines.length; i++) {
-              var line = lines[i];
-              if (!line.startsWith('data: ')) continue;
-              try {
-                var evt = JSON.parse(line.slice(6));
-                var as = analysisState;
-                var cur = __getAnalysisState(id);
-                if (evt.type === 'status') {
-                  __setAnalysisState(id, { status: 'running', text: evt.text, fullText: (cur.fullText || '') + evt.text + '\n' });
-                } else if (evt.type === 'done') {
-                  __setAnalysisState(id, { status: 'done', text: evt.text, fullText: (cur.fullText || '') + evt.text + '\n', fix_stored: evt.fix_stored });
-                  setFlashMsg({ text: 'Analysis complete!', type: 'success' });
-                  loadErrors(activeTab);
-                } else if (evt.type === 'error') {
-                  __setAnalysisState(id, { status: 'failed', text: evt.text, fullText: (cur.fullText || '') + evt.text + '\n' });
-                  setFlashMsg({ text: evt.text, type: 'error' });
-                } else if (evt.type === 'closed') {
-                  // Stream ended
-                }
-              } catch (e) {}
-            }
-            read();
-          }).catch(function () {});
-        }
-        read();
-      }).catch(function (e) {
-        console.error('[log-doctor] SSE error:', e);
-        setFlashMsg({ text: 'Stream connection failed', type: 'error' });
-      });
+    function pollAnalysisResult(id, timer) {
+      setTimeout(function () {
+        apiGet('/errors/' + id + '/analysis-status').then(function (data) {
+          if (data.status === 'completed') {
+            clearInterval(timer);
+            setAnalysisRunning(false);
+            setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'done', text: data.fix_description || '', fix_command: data.fix_command || '' }}));
+            setFlashMsg({ text: 'Analysis complete!', type: 'success' });
+            loadErrors(activeTab);
+          } else if (data.status === 'failed') {
+            clearInterval(timer);
+            setAnalysisRunning(false);
+            setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'failed', text: data.error || 'Unknown error' }}));
+            setFlashMsg({ text: 'Analysis failed', type: 'error' });
+          } else {
+            // Still running — poll again
+            pollAnalysisResult(id, timer);
+          }
+        }).catch(function () {
+          pollAnalysisResult(id, timer); // Retry
+        });
+      }, 2000);
     }
 
     // Helper to get/set analysis state bypassing React batching for streaming
@@ -308,12 +298,25 @@
         errors.map(function (e) {
           var isExpanded = !!expanded[e.id];
           var fr = fixResults[e.id];
+          var as = analysisState[e.id];
+          var hasFix = !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:'));
+          var isRunning = as && as.status === 'running';
+          var isDone = hasFix || (as && as.status === 'done');
+          var isFailed = as && as.status === 'failed';
+
+          // Status badge: small colored label in header
+          var statusBadge = null;
+          if (isRunning) statusBadge = h('span', { style: { fontSize: '10px', color: '#7aa2f7', fontStyle: 'italic', marginLeft: 'auto', flexShrink: 0 } }, 'analyzing...');
+          else if (isDone) statusBadge = h('span', { style: { fontSize: '10px', color: '#9ece6a', marginLeft: 'auto', flexShrink: 0 } }, '✓ analyzed');
+          else if (isFailed) statusBadge = h('span', { style: { fontSize: '10px', color: '#f7768e', marginLeft: 'auto', flexShrink: 0 } }, '✗ failed');
+
           return h('li', { key: e.id, style: style.errorItem },
             h('div', { style: style.errorHeader, onClick: function () { toggleExpand(e.id); } },
               h('span', { style: { fontSize: '12px', color: '#565f89', transition: 'transform 0.2s', transform: isExpanded ? 'rotate(90deg)' : 'none' } }, '\u25B6'),
               h('span', { style: style.typeBadge(e.error_type) }, e.error_type),
               h('span', { style: style.msg }, e.message),
-              h('span', { style: style.countBadge }, '\u00D7' + e.count)
+              h('span', { style: style.countBadge }, '\u00D7' + e.count),
+              statusBadge
             ),
             isExpanded && h('div', { style: style.detail },
               h('div', { style: style.label }, 'First Seen'), h('div', { style: style.value }, e.first_seen),
@@ -321,11 +324,6 @@
               e.file_path && h('div', {}, h('div', { style: style.label }, 'File'), h('div', { style: style.value }, e.file_path + (e.line_number ? ':' + e.line_number : ''))),
               e.context && h('div', {}, h('div', { style: style.label }, 'Raw Log'), h('pre', { style: style.pre }, e.context)),
               (function () {
-                var as = analysisState[e.id];
-                var hasFix = !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:'));
-                var isRunning = as && as.status === 'running';
-                var showResult = hasFix || (as && as.status === 'done');
-                var showError = as && as.status === 'failed';
                 var resultText = hasFix ? e.fix_description : (as ? as.text : '');
                 var resultCmd = hasFix ? (e.fix_command || '') : (as ? as.fix_command || '' : '');
 
@@ -336,14 +334,14 @@
                 );
 
                 // Done: show result
-                if (showResult) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
+                if (isDone) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
                   h('div', { style: { color: '#9ece6a', fontWeight: 'bold', marginBottom: '4px' } }, '✅ Agent Analysis'),
                   h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(resultText) } }),
                   resultCmd && h('pre', { style: style.pre }, resultCmd)
                 );
 
                 // Failed
-                if (showError) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(247,118,142,0.1)', border: '1px solid #f7768e', color: '#f7768e', fontSize: '12px' } }, '❌ Analysis failed: ' + (as.error || 'unknown'));
+                if (isFailed) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(247,118,142,0.1)', border: '1px solid #f7768e', color: '#f7768e', fontSize: '12px' } }, '❌ Analysis failed: ' + (as.error || 'unknown'));
 
                 return null;
               })(),
@@ -351,20 +349,22 @@
                 // --- Ask Agent ---
                 e.status === 'active' && h('button', {
                   style: Object.assign({}, style.btn, (
+                    analysisRunning ? { opacity: 0.4, cursor: 'not-allowed' } :
                     (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? { opacity: 0.4, cursor: 'not-allowed', borderColor: '#9ece6a', color: '#9ece6a' } :
                     (analysisState[e.id] && analysisState[e.id].status === 'running') ? { opacity: 0.4, cursor: 'not-allowed' } :
                     {}
                   )),
-                  disabled: !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || !!(analysisState[e.id] && analysisState[e.id].status === 'running'),
+                  disabled: analysisRunning || !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || !!(analysisState[e.id] && analysisState[e.id].status === 'running'),
                   onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doAnalyze(e.id); }
-                }, (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? '✓ Analyzed' :
+                }, analysisRunning ? '⏳ Waiting...' :
+                   (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? '✓ Analyzed' :
                    (analysisState[e.id] && analysisState[e.id].status === 'running') ? 'Analyzing...' : 'Ask Agent'),
                 // --- Apply Fix ---
                 h('button', {
                   style: Object.assign({}, style.btnFix, (
-                    !(e.fix_command && !e.fix_applied_at && ((e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || (analysisState[e.id] && analysisState[e.id].status === 'done')))
+                    !(e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && !e.fix_applied_at)
                   ) ? { opacity: 0.3, cursor: 'not-allowed' } : {}),
-                  disabled: !(e.fix_command && !e.fix_applied_at && ((e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || (analysisState[e.id] && analysisState[e.id].status === 'done'))),
+                  disabled: !(e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && !e.fix_applied_at),
                   onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doFix(e.id); }
                 }, 'Apply Fix'),
                 // --- Ignore ---

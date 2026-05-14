@@ -17,7 +17,7 @@ log-doctor/
 ├── README.md                 # User-facing docs
 └── dashboard/
     ├── manifest.json          # Dashboard tab declaration (name, icon, entry, api)
-    ├── plugin_api.py          # FastAPI router mounted at /api/plugins/log-doctor/
+    ├── plugin_api.py          # FastAPI router + background analysis threads
     └── dist/
         ├── index.js           # Frontend React component (vanilla JS via SDK)
         └── style.css          # Stylesheet (currently empty — styles inline in JS)
@@ -25,14 +25,9 @@ log-doctor/
 
 ## Development Environment
 
-The plugin runs inside the Hermes Agent process. No separate venv needed.
-
 ```bash
 # Deploy to Hermes
 cp -r . ~/.hermes/plugins/log-doctor/
-
-# Enable in config.yaml
-#   plugins.enabled: [log-doctor]
 
 # Restart dashboard
 systemctl --user restart hermes-dashboard
@@ -43,7 +38,7 @@ tail -f ~/.hermes/logs/agent.log | grep -i log-doctor
 
 ## Architecture
 
-### Two surfaces, one database
+### Three surfaces, one database
 
 ```
 ┌─────────────────────┐     ┌──────────────────────┐
@@ -56,51 +51,73 @@ tail -f ~/.hermes/logs/agent.log | grep -i log-doctor
 │  ignore_log_error    │     │    log-doctor.db     │
 └─────────────────────┘     └──────────────────────┘
                                     │
-                             ┌──────▼──────┐
-                             │  Dashboard   │
-                             │  UI (React)  │
-                             └─────────────┘
+                  ┌─────────────────▼─────┐
+                  │  Analysis Engine      │
+                  │  (background thread)  │
+                  │  AIAgent + SessionDB  │
+                  └─────────┬─────────────┘
+                            │
+                   ┌────────▼────────┐
+                   │  Dashboard UI   │
+                   │  (React SDK)    │
+                   │  polling loop   │
+                   └─────────────────┘
 ```
 
-### Tool handlers
+### Error Analysis Flow
 
-All handlers in `tools.py` follow the Hermes plugin contract:
-- Accept `(args, **kwargs)` — `**kwargs` required for forward compatibility
-- Return `json.dumps(...)` — NEVER a raw dict
-- Catch all exceptions and return `{"ok": False, "error": str(e)}`
+1. User clicks "Ask Agent" → `POST /errors/:id/analyze`
+2. Backend creates queue + starts background thread
+3. Thread creates `AIAgent` with `session_id="log-doctor-session"` and `SessionDB`
+4. Agent runs analysis prompt with strict rules:
+   - **ONLY** allowed: `analyze_log_error` + `suggest_error_fix`
+   - **FORBIDDEN**: terminal, patch, write_file, any state-changing tool
+5. Frontend polls `GET /errors/:id/analysis-status` every 2s
+6. On completion, stores `fix_description` in SQLite → survives page refresh
+7. User can click "Apply Fix" to execute the stored `fix_command`
 
-### Dashboard plugin
+### Session Strategy
 
-The dashboard surface uses two files:
-- `manifest.json` — declares tab name, icon, JS entry, API file
-- `plugin_api.py` — FastAPI `APIRouter` with a `router` attribute
-- `dist/index.js` — React component using `window.__HERMES_PLUGIN_SDK__`
+All analyses share one session: `log-doctor-session`. Only ONE analysis runs at a time
+(global `analysisRunning` lock in frontend). Other "Ask Agent" buttons show "⏳ Waiting..."
+until the running analysis completes.
 
-The JS module calls `window.__HERMES_PLUGINS__.register('log-doctor', Component)`.
+### Button States
 
-The API is mounted at `/api/plugins/log-doctor/` by the dashboard's plugin loader.
+| State | Ask Agent | Apply Fix | Ignore |
+|-------|-----------|-----------|--------|
+| Not analyzed | 🟢 Ask Agent | 🔒 greyed | 🟢 Ignore |
+| Running (this) | 🔒 Analyzing... | 🔒 greyed | 🟢 Ignore |
+| Running (other) | ⏳ Waiting... | 🔒 greyed | 🟢 Ignore |
+| Done | ✅ Analyzed (grey) | 🟢 enabled | 🟢 Ignore |
+| Failed | ✗ failed (grey) | 🔒 greyed | 🟢 Ignore |
+
+### Status Badges
+
+Each error item shows a colored badge in the header:
+- `analyzing...` (blue) — analysis in progress
+- `✓ analyzed` (green) — analysis complete
+- `✗ failed` (red) — analysis failed
+- (none) — not yet analyzed
 
 ## Import Rules
 
-**CRITICAL**: The plugin's `tools.py` module name conflicts with Hermes's built-in `tools/` package. Use relative imports within the plugin package:
+**CRITICAL**: The plugin's `tools.py` module name conflicts with Hermes's built-in `tools/` package.
 
 ```python
 # In __init__.py (loaded as a package by the plugin system)
 from .tools import handler_scan_logs   # ✓ relative
-```
 
-```python
 # In tools.py (may be loaded standalone by dashboard API)
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from db import connect  # ✓ absolute with path injection
-```
 
-```python
-# In dashboard/plugin_api.py (loaded via importlib)
+# In dashboard/plugin_api.py (loaded via importlib to avoid collision)
 import importlib.util
 spec = importlib.util.spec_from_file_location("log_doctor_db", str(PLUGIN_DIR / "db.py"))
 mod = importlib.util.module_from_spec(spec)
+sys.modules["db"] = mod  # register before exec for inter-module refs
 spec.loader.exec_module(mod)
 ```
 
@@ -109,7 +126,7 @@ spec.loader.exec_module(mod)
 SQLite at `~/.hermes/log-doctor.db`. Auto-created on first use.
 
 Tables:
-- `error_entries` — deduplicated errors with hash, count, status, fix info
+- `error_entries` — deduplicated errors (hash, type, message, context, count, status, fix_description, fix_command)
 - `scan_runs` — audit log of each scan
 
 Deduplication key: `SHA256(source|error_type|message)[:16]`
@@ -118,7 +135,11 @@ Status flow: `active → ignored (manual) → fixed (after fix applied)`
 
 ## Common Pitfalls
 
-1. **`useState` must be called, not referenced**: `useState('default')` returns `[value, setter]`. Just writing `var s = useState` does nothing.
-2. **Dashboard JS entry must register**: Failure to call `PLUGINS.register(...)` results in blank tab.
+1. **`useState` must be CALLED**: `useState('default')` returns `[value, setter]`. Writing `var s = useState` references the function, not the result.
+2. **Dashboard JS entry must register**: Must call `PLUGINS.register('log-doctor', Component)` or tab is blank.
 3. **Handler must return JSON string**: Returning a dict causes "unhashable type" errors.
-4. **`tools` import collision**: Never do `from tools import ...` in plugin code — always use `.tools` or importlib.
+4. **`tools` import collision**: Never do `from tools import ...` in plugin code.
+5. **SQLite cross-thread**: Analysis thread must create its own DB connection. Cannot reuse the dashboard main-thread connection.
+6. **Variable rename sync**: When renaming variables (`showResult`→`isDone`), update ALL references.
+7. **No git push without user approval**: Per system_prompt: commit+push requires explicit user confirmation.
+8. **Agent analysis sandbox**: Agent prompt must explicitly forbid terminal/patch/write_file — diagnosis only.
