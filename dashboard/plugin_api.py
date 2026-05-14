@@ -21,6 +21,11 @@ from hermes_constants import get_hermes_home
 # Ensure the plugin's own modules are importable
 import importlib.util
 _PLUGIN_DIR = Path(__file__).resolve().parent.parent
+_HERMES_AGENT_DIR = Path("/home/j1s/.hermes/hermes-agent")
+
+def _now_iso():
+    from datetime import datetime, timezone
+    return datetime.now(timezone.utc).isoformat()
 
 # Load plugin-local modules via importlib to avoid conflict with hermes-agent's tools/ package
 _spec_db = importlib.util.spec_from_file_location(
@@ -239,10 +244,9 @@ def api_apply_fix(error_id: int, dry_run: bool = False):
         raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-
 @router.post("/errors/{error_id}/analyze")
-def api_request_analysis(error_id: int):
+def api_analyze_with_agent(error_id: int):
+    """Run agent analysis via a one-shot cron job. Returns job_id for polling."""
     conn = _get_db()
     try:
         record = conn.execute(
@@ -251,21 +255,126 @@ def api_request_analysis(error_id: int):
         if not record:
             raise HTTPException(status_code=404, detail=f"Error {error_id} not found")
         r = dict(record)
+
+        prompt = (
+            f"You are a Log Doctor analysis agent. Analyze this error and call suggest_error_fix to store your diagnosis.\n\n"
+            f"Error ID: {error_id}\n"
+            f"Error Type: {r['error_type']}\n"
+            f"Message: {r['message']}\n"
+            f"Occurrences: {r['count']} times (first: {r['first_seen']}, last: {r['last_seen']})\n"
+            f"Source: {r['source']}\n"
+            f"Context: {r.get('context', 'N/A')[:500]}\n\n"
+            f"Steps:\n"
+            f"1. Call analyze_log_error(error_id={error_id}) to get full details\n"
+            f"2. Diagnose the root cause\n"
+            f"3. Call suggest_error_fix(error_id={error_id}, description=\"...\", command=\"...\")\n"
+            f"   - description: human-readable root cause and fix explanation\n"
+            f"   - command: shell command to apply the fix (or empty string if manual)\n\n"
+            f"Be concise. Only output your diagnosis and then call suggest_error_fix."
+        )
+
+        name = f"log-doctor-analysis-{error_id}"
+
+        # Create a one-shot cron job that runs immediately
+        import sys
+        sys.path.insert(0, str(_HERMES_AGENT_DIR))
+        from cron.jobs import create_job
+
+        job = create_job(
+            prompt=prompt,
+            schedule=_now_iso(),  # run once immediately
+            name=name,
+            repeat=1,
+            deliver="local",
+            skills=["log-doctor"],
+            enabled_toolsets=["terminal", "file"],
+        )
+
+        # Store job_id in error record so frontend can poll
+        conn.execute(
+            "UPDATE error_entries SET fix_description = ?, fix_command = ? WHERE id = ?",
+            (f"__analysis_job__:{job['id']}", "", error_id),
+        )
+        conn.commit()
+
         return {
             "ok": True,
-            "error": r,
-            "analysis_prompt": (
-                f"Analyze this Hermes log error:\n\n"
-                f"**Error Type**: {r['error_type']}\n"
-                f"**Message**: {r['message']}\n"
-                f"**Source**: {r['source']}\n"
-                f"**Occurrences**: {r['count']} times (first: {r['first_seen']}, last: {r['last_seen']})\n"
-                f"**Context**: {r.get('context', 'N/A')}\n\n"
-                f"Please diagnose the root cause and suggest a fix. "
-                f"Then call suggest_error_fix(error_id={error_id}, description='...', command='...') "
-                f"to record your diagnosis."
-            ),
+            "analysis_queued": True,
+            "error_id": error_id,
+            "job_id": job["id"],
+            "job_name": name,
         }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.get("/errors/{error_id}/analysis-status")
+def api_analysis_status(error_id: int):
+    """Check if the analysis cron job has completed."""
+    conn = _get_db()
+    try:
+        record = conn.execute(
+            "SELECT * FROM error_entries WHERE id = ?", (error_id,)
+        ).fetchone()
+        if not record:
+            raise HTTPException(status_code=404, detail=f"Error {error_id} not found")
+        r = dict(record)
+
+        # Check if fix_description contains our job marker
+        fd = r.get("fix_description") or ""
+        if fd.startswith("__analysis_job__:"):
+            job_id = fd.split(":", 1)[1]
+            import sys
+            sys.path.insert(0, str(_HERMES_AGENT_DIR))
+            from cron.jobs import load_jobs
+
+            jobs = load_jobs()
+            job = next((j for j in jobs.get("jobs", []) if j["id"] == job_id), None)
+
+            if not job:
+                return {"ok": True, "status": "unknown", "error_id": error_id}
+
+            status = job.get("last_status", "pending")
+            if status == "ok":
+                # Job completed — check if fix was actually stored
+                if r.get("fix_description") and not r["fix_description"].startswith("__analysis_job__:"):
+                    return {
+                        "ok": True,
+                        "status": "completed",
+                        "error_id": error_id,
+                        "fix_description": r["fix_description"],
+                        "fix_command": r["fix_command"],
+                    }
+                else:
+                    return {
+                        "ok": True,
+                        "status": "completed_no_fix",
+                        "error_id": error_id,
+                        "message": "Analysis completed but no fix was suggested.",
+                    }
+            elif status in ("error", "failed"):
+                return {
+                    "ok": True,
+                    "status": "failed",
+                    "error_id": error_id,
+                    "error": job.get("last_error", "Unknown error"),
+                }
+            else:
+                return {"ok": True, "status": "running", "error_id": error_id}
+
+        # No analysis job marker — check if fix already exists
+        if r.get("fix_description"):
+            return {
+                "ok": True,
+                "status": "completed",
+                "error_id": error_id,
+                "fix_description": r["fix_description"],
+                "fix_command": r["fix_command"],
+            }
+
+        return {"ok": True, "status": "not_started", "error_id": error_id}
     except HTTPException:
         raise
     except Exception as exc:

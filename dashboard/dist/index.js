@@ -65,6 +65,8 @@
 
     var _ref8 = useState('');
     var typeFilter = _ref8[0], setTypeFilter = _ref8[1];
+    var _ref9 = useState({});
+    var analysisState = _ref9[0], setAnalysisState = _ref9[1];
 
     useEffect(function () {
       loadErrors(activeTab);
@@ -129,19 +131,46 @@
       });
     }
     function doAnalyze(id) {
+      setAnalysisState(Object.assign({}, analysisState, {[id]: 'running'}));
       apiPost('/errors/' + id + '/analyze').then(function (data) {
-        if (data.analysis_prompt) {
-          var ta = document.createElement('textarea');
-          ta.value = data.analysis_prompt;
-          ta.style.position = 'fixed'; ta.style.left = '-9999px';
-          document.body.appendChild(ta);
-          ta.select();
-          var copied = false;
-          try { document.execCommand('copy'); copied = true; } catch (e) {}
-          document.body.removeChild(ta);
-          setFlashMsg({ text: copied ? 'Analysis prompt copied! Paste to Hermes agent.' : 'Copy failed. Manually use: scan_hermes_logs then analyze_log_error id=' + id, type: copied ? 'success' : 'error' });
+        if (data.analysis_queued) {
+          setFlashMsg({ text: 'Agent analysis started...', type: 'success' });
+          pollAnalysis(id);
+        } else {
+          setAnalysisState(Object.assign({}, analysisState, {[id]: 'failed'}));
         }
-      }).catch(function (e) { setFlashMsg({ text: e.message, type: 'error' }); });
+      }).catch(function (e) {
+        setFlashMsg({ text: e.message, type: 'error' });
+        setAnalysisState(Object.assign({}, analysisState, {[id]: 'failed'}));
+      });
+    }
+
+    function pollAnalysis(id) {
+      setTimeout(function () {
+        apiGet('/errors/' + id + '/analysis-status').then(function (data) {
+          if (data.status === 'completed') {
+            setAnalysisState(Object.assign({}, analysisState, {[id]: {
+              status: 'done',
+              fix_description: data.fix_description,
+              fix_command: data.fix_command
+            }}));
+            setFlashMsg({ text: 'Analysis complete!', type: 'success' });
+            loadErrors(activeTab);
+          } else if (data.status === 'failed') {
+            setAnalysisState(Object.assign({}, analysisState, {[id]: {status: 'failed', error: data.error}}));
+            setFlashMsg({ text: 'Analysis failed: ' + (data.error || 'unknown'), type: 'error' });
+          } else if (data.status === 'completed_no_fix') {
+            setAnalysisState(Object.assign({}, analysisState, {[id]: {status: 'done_no_fix', message: data.message}}));
+            setFlashMsg({ text: 'Analysis done but no fix suggested.', type: 'success' });
+            loadErrors(activeTab);
+          } else {
+            // Still running, poll again
+            pollAnalysis(id);
+          }
+        }).catch(function () {
+          pollAnalysis(id); // Retry on network error
+        });
+      }, 2000);
     }
 
     function tabClass(name) {
@@ -233,13 +262,27 @@
               h('div', { style: style.label }, 'Last Seen'), h('div', { style: style.value }, e.last_seen),
               e.file_path && h('div', {}, h('div', { style: style.label }, 'File'), h('div', { style: style.value }, e.file_path + (e.line_number ? ':' + e.line_number : ''))),
               e.context && h('div', {}, h('div', { style: style.label }, 'Raw Log'), h('pre', { style: style.pre }, e.context)),
-              e.fix_description && h('div', {}, h('div', { style: style.label }, 'Fix Suggestion'), h('div', { style: style.value }, e.fix_description)),
+              e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && h('div', {}, h('div', { style: style.label }, 'Fix Suggestion'), h('div', { style: style.value }, e.fix_description)),
               e.fix_command && h('div', {}, h('div', { style: style.label }, 'Fix Command'), h('pre', { style: style.pre }, e.fix_command)),
+              (function () {
+                var as = analysisState[e.id];
+                if (!as) return null;
+                if (as === 'running') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(122,162,247,0.1)', border: '1px solid #7aa2f7', color: '#7aa2f7', fontSize: '12px' } }, '\u23F3 Agent analyzing this error...');
+                if (as.status === 'done') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
+                  h('div', { style: { color: '#9ece6a', fontWeight: 'bold', marginBottom: '4px' } }, '\u2705 Agent Analysis'),
+                  h('div', { style: { color: '#c0caf5', marginBottom: '4px' } }, as.fix_description),
+                  as.fix_command && h('pre', { style: style.pre }, as.fix_command),
+                  !e.fix_applied_at && h('button', { style: style.btnFix, onClick: function (ev) { ev.stopPropagation(); doFix(e.id); } }, 'Apply Fix')
+                );
+                if (as.status === 'done_no_fix') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(224,175,104,0.1)', border: '1px solid #e0af68', color: '#e0af68', fontSize: '12px' } }, '\u26A0 ' + (as.message || 'Analysis completed without fix'));
+                if (as.status === 'failed') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(247,118,142,0.1)', border: '1px solid #f7768e', color: '#f7768e', fontSize: '12px' } }, '\u274C Analysis failed: ' + (as.error || 'unknown'));
+                return null;
+              })(),
               h('div', { style: style.actions },
-                e.status === 'active' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doAnalyze(e.id); } }, 'Ask Agent'),
+                e.status === 'active' && !analysisState[e.id] && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doAnalyze(e.id); } }, 'Ask Agent'),
+                e.status === 'active' && analysisState[e.id] !== 'running' && e.fix_command && h('button', { style: style.btnFix, onClick: function (ev) { ev.stopPropagation(); doFix(e.id); } }, 'Apply Fix'),
                 e.status === 'active' && h('button', { style: style.btnIgnore, onClick: function (ev) { ev.stopPropagation(); doIgnore(e.id); } }, 'Ignore'),
-                e.status === 'ignored' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doUnignore(e.id); } }, 'Un-ignore'),
-                e.fix_command && e.status === 'active' && h('button', { style: style.btnFix, onClick: function (ev) { ev.stopPropagation(); doFix(e.id); } }, 'Apply Fix')
+                e.status === 'ignored' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doUnignore(e.id); } }, 'Un-ignore')
               ),
               fr && fr.ok && h('div', { style: style.fixOk }, 'Fix applied! Exit code: ' + fr.result.exit_code),
               fr && !fr.ok && h('div', { style: style.fixFail }, fr.error || 'Fix failed')
