@@ -312,10 +312,11 @@ def _run_analysis_in_thread(error_id: int, prompt: str):
         final_response = result.get("final_response", "") if isinstance(result, dict) else str(result)
         push("status", "Analysis complete, storing fix...")
 
-        # Store the fix in the database
-        conn = _get_db()
+        # Store the fix — use a fresh connection for this thread
+        from db import connect as _db_thread_connect, init_db as _db_thread_init, set_fix as _sf
+        conn = _db_thread_connect()
+        _db_thread_init(conn)
         try:
-            from db import set_fix as _sf
             _sf(conn, error_id, final_response[:2000], "")
             conn.commit()
         finally:
