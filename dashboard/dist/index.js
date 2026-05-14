@@ -80,6 +80,16 @@
         .then(function (data) {
           setErrors(data.errors || []);
           setStats(data.stats || {});
+          // Restore analysis state from DB (survives page refresh)
+          var restored = {};
+          for (var i = 0; i < (data.errors || []).length; i++) {
+            var e = data.errors[i];
+            var fd = e.fix_description || '';
+            if (fd && !fd.startsWith('__analysis_job__:')) {
+              restored[e.id] = { status: 'done', text: fd, fix_command: e.fix_command || '' };
+            }
+          }
+          setAnalysisState(restored);
           setLoading(false);
         })
         .catch(function (e) {
@@ -310,28 +320,54 @@
               h('div', { style: style.label }, 'Last Seen'), h('div', { style: style.value }, e.last_seen),
               e.file_path && h('div', {}, h('div', { style: style.label }, 'File'), h('div', { style: style.value }, e.file_path + (e.line_number ? ':' + e.line_number : ''))),
               e.context && h('div', {}, h('div', { style: style.label }, 'Raw Log'), h('pre', { style: style.pre }, e.context)),
-              e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && h('div', {}, h('div', { style: style.label }, 'Fix Suggestion'), h('div', { style: style.value }, e.fix_description)),
-              e.fix_command && h('div', {}, h('div', { style: style.label }, 'Fix Command'), h('pre', { style: style.pre }, e.fix_command)),
               (function () {
                 var as = analysisState[e.id];
-                if (!as) return null;
-                if (as.status === 'running') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: '#1a1b26', border: '1px solid #414868', fontSize: '12px', maxHeight: '400px', overflowY: 'auto', color: '#c0caf5' } },
-                  h('div', { style: { color: '#7aa2f7', marginBottom: '6px', fontWeight: 'bold' } }, '\u23F3 Agent Analysis — log-doctor-session'),
+                var hasFix = !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:'));
+                var isRunning = as && as.status === 'running';
+                var showResult = hasFix || (as && as.status === 'done');
+                var showError = as && as.status === 'failed';
+                var resultText = hasFix ? e.fix_description : (as ? as.text : '');
+                var resultCmd = hasFix ? (e.fix_command || '') : (as ? as.fix_command || '' : '');
+
+                // Running: live stream
+                if (isRunning) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: '#1a1b26', border: '1px solid #414868', fontSize: '12px', maxHeight: '400px', overflowY: 'auto', color: '#c0caf5' } },
+                  h('div', { style: { color: '#7aa2f7', marginBottom: '6px', fontWeight: 'bold' } }, '⏳ Agent Analysis — log-doctor-session'),
                   h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(as.fullText || as.text) || 'Initializing...' } })
                 );
-                if (as.status === 'done') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
-                  h('div', { style: { color: '#9ece6a', fontWeight: 'bold', marginBottom: '4px' } }, '\u2705 Agent Analysis'),
-                  h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(as.text || as.fix_description) } }),
-                  as.fix_command && h('pre', { style: style.pre }, as.fix_command),
-                  !e.fix_applied_at && h('button', { style: style.btnFix, onClick: function (ev) { ev.stopPropagation(); doFix(e.id); } }, 'Apply Fix')
+
+                // Done: show result
+                if (showResult) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
+                  h('div', { style: { color: '#9ece6a', fontWeight: 'bold', marginBottom: '4px' } }, '✅ Agent Analysis'),
+                  h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(resultText) } }),
+                  resultCmd && h('pre', { style: style.pre }, resultCmd)
                 );
-                if (as.status === 'done_no_fix') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(224,175,104,0.1)', border: '1px solid #e0af68', color: '#e0af68', fontSize: '12px' } }, '\u26A0 ' + (as.message || 'Analysis completed without fix'));
-                if (as.status === 'failed') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(247,118,142,0.1)', border: '1px solid #f7768e', color: '#f7768e', fontSize: '12px' } }, '\u274C Analysis failed: ' + (as.error || 'unknown'));
+
+                // Failed
+                if (showError) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(247,118,142,0.1)', border: '1px solid #f7768e', color: '#f7768e', fontSize: '12px' } }, '❌ Analysis failed: ' + (as.error || 'unknown'));
+
                 return null;
               })(),
               h('div', { style: style.actions },
-                e.status === 'active' && !analysisState[e.id] && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doAnalyze(e.id); } }, 'Ask Agent'),
-                e.status === 'active' && analysisState[e.id] && analysisState[e.id].status !== 'running' && e.fix_command && h('button', { style: style.btnFix, onClick: function (ev) { ev.stopPropagation(); doFix(e.id); } }, 'Apply Fix'),
+                // --- Ask Agent ---
+                e.status === 'active' && h('button', {
+                  style: Object.assign({}, style.btn, (
+                    (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? { opacity: 0.4, cursor: 'not-allowed', borderColor: '#9ece6a', color: '#9ece6a' } :
+                    (analysisState[e.id] && analysisState[e.id].status === 'running') ? { opacity: 0.4, cursor: 'not-allowed' } :
+                    {}
+                  )),
+                  disabled: !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || !!(analysisState[e.id] && analysisState[e.id].status === 'running'),
+                  onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doAnalyze(e.id); }
+                }, (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? '✓ Analyzed' :
+                   (analysisState[e.id] && analysisState[e.id].status === 'running') ? 'Analyzing...' : 'Ask Agent'),
+                // --- Apply Fix ---
+                h('button', {
+                  style: Object.assign({}, style.btnFix, (
+                    !(e.fix_command && !e.fix_applied_at && ((e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || (analysisState[e.id] && analysisState[e.id].status === 'done')))
+                  ) ? { opacity: 0.3, cursor: 'not-allowed' } : {}),
+                  disabled: !(e.fix_command && !e.fix_applied_at && ((e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || (analysisState[e.id] && analysisState[e.id].status === 'done'))),
+                  onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doFix(e.id); }
+                }, 'Apply Fix'),
+                // --- Ignore ---
                 e.status === 'active' && h('button', { style: style.btnIgnore, onClick: function (ev) { ev.stopPropagation(); doIgnore(e.id); } }, 'Ignore'),
                 e.status === 'ignored' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doUnignore(e.id); } }, 'Un-ignore')
               ),
