@@ -201,6 +201,26 @@
       setAnalysisState(Object.assign({}, analysisState, _analysisStateCache));
     }
 
+    // -------------------------------------------------------------------
+    // Markdown → HTML converter
+    // -------------------------------------------------------------------
+    function mdToHtml(md) {
+      if (!md) return '';
+      var h = md;
+      h = h.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre style="background:#1a1b26;padding:8px 12px;border-radius:6px;overflow-x:auto;font-size:12px"><code>$2</code></pre>');
+      h = h.replace(/`([^`]+)`/g, '<code style="background:#414868;padding:1px 4px;border-radius:3px;font-size:12px">$1</code>');
+      h = h.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+      h = h.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+      h = h.replace(/^### (.+)$/gm, '<h4 style="color:#7aa2f7;margin:8px 0 4px">$1</h4>');
+      h = h.replace(/^## (.+)$/gm, '<h3 style="color:#7aa2f7;margin:8px 0 4px">$1</h3>');
+      h = h.replace(/^# (.+)$/gm, '<h2 style="color:#7aa2f7;margin:8px 0 4px">$1</h2>');
+      h = h.replace(/^- (.+)$/gm, '<li style="margin-left:16px;color:#c0caf5">$1</li>');
+      h = h.replace(/^\d+\. (.+)$/gm, '<li style="margin-left:16px;color:#c0caf5">$1</li>');
+      h = h.replace(/\n\n/g, '</p><p style="margin:4px 0">');
+      h = h.replace(/\n/g, '<br>');
+      return '<p style="margin:4px 0">' + h + '</p>';
+    }
+
     function tabClass(name) {
       return name === activeTab ? 'tab-btn active' : 'tab-btn';
     }
@@ -295,13 +315,13 @@
               (function () {
                 var as = analysisState[e.id];
                 if (!as) return null;
-                if (as.status === 'running') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: '#1a1b26', border: '1px solid #414868', fontSize: '12px', fontFamily: 'monospace', maxHeight: '400px', overflowY: 'auto', whiteSpace: 'pre-wrap', color: '#c0caf5' } },
-                  h('div', { style: { color: '#7aa2f7', marginBottom: '6px' } }, '\u23F3 Agent Analysis — log-doctor-session'),
-                  as.fullText || as.text || 'Initializing...'
+                if (as.status === 'running') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: '#1a1b26', border: '1px solid #414868', fontSize: '12px', maxHeight: '400px', overflowY: 'auto', color: '#c0caf5' } },
+                  h('div', { style: { color: '#7aa2f7', marginBottom: '6px', fontWeight: 'bold' } }, '\u23F3 Agent Analysis — log-doctor-session'),
+                  h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(as.fullText || as.text) || 'Initializing...' } })
                 );
                 if (as.status === 'done') return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
                   h('div', { style: { color: '#9ece6a', fontWeight: 'bold', marginBottom: '4px' } }, '\u2705 Agent Analysis'),
-                  h('div', { style: { color: '#c0caf5', marginBottom: '4px' } }, as.fix_description),
+                  h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(as.text || as.fix_description) } }),
                   as.fix_command && h('pre', { style: style.pre }, as.fix_command),
                   !e.fix_applied_at && h('button', { style: style.btnFix, onClick: function (ev) { ev.stopPropagation(); doFix(e.id); } }, 'Apply Fix')
                 );
