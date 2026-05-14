@@ -63,13 +63,18 @@
     if (!expanded) { expanded = {}; }
     if (!fixResults) { fixResults = {}; }
 
+    var _ref8 = useState('');
+    var typeFilter = _ref8[0], setTypeFilter = _ref8[1];
+
     useEffect(function () {
       loadErrors(activeTab);
-    }, [activeTab]);
+    }, [activeTab, typeFilter]);
 
     function loadErrors(tab) {
       setLoading(true);
-      apiGet('/errors?status=' + (tab === 'ignored' ? 'ignored' : tab === 'fixed' ? 'fixed' : 'active'))
+      var query = '/errors?status=' + (tab === 'ignored' ? 'ignored' : tab === 'fixed' ? 'fixed' : 'active');
+      if (typeFilter) { query += '&error_type=' + typeFilter; }
+      apiGet(query)
         .then(function (data) {
           setErrors(data.errors || []);
           setStats(data.stats || {});
@@ -187,6 +192,21 @@
           'Ignored ', h('span', { style: style.count }, stats.ignored || 0)),
         h('button', { style: activeTab === 'fixed' ? style.tabBtnActive : style.tabBtn, onClick: function () { setActiveTab('fixed'); } },
           'Fixed ', h('span', { style: style.count }, stats.fixed || 0))
+      ),
+
+      h('div', { style: { display: 'flex', gap: '4px', marginBottom: '12px' } },
+        ['All', 'WARNING', 'ERROR', 'CRITICAL'].map(function (t) {
+          var isActive = typeFilter === (t === 'All' ? '' : t);
+          return h('button', {
+            key: t,
+            style: {
+              padding: '4px 12px', border: '1px solid #414868', borderRadius: '4px',
+              background: isActive ? 'rgba(122,162,247,0.15)' : 'transparent',
+              color: isActive ? '#7aa2f7' : '#565f89', cursor: 'pointer', fontSize: '12px'
+            },
+            onClick: function () { setTypeFilter(t === 'All' ? '' : t); }
+          }, t);
+        })
       ),
 
       loading ? h('div', { style: style.empty }, 'Loading...') :

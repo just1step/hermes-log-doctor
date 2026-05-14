@@ -77,17 +77,36 @@ DEFAULT_LOG = get_hermes_home() / "logs" / "errors.log"
 @router.get("/errors")
 def api_list_errors(
     status: str = Query("active", description="active | ignored | fixed | all"),
+    error_type: str = Query("", description="Filter by type: WARNING, ERROR, CRITICAL (empty = all)"),
     limit: int = Query(200, ge=1, le=1000),
 ):
     conn = _get_db()
     try:
+        type_clause = ""
+        params: list = []
         if status == "all":
-            active = _db_list(conn, "active")
-            ignored = _db_list(conn, "ignored")
-            fixed = _db_list(conn, "fixed")
-            errors = active + ignored + fixed
+            if error_type:
+                rows = conn.execute(
+                    "SELECT * FROM error_entries WHERE error_type = ? ORDER BY last_seen DESC",
+                    (error_type,)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM error_entries ORDER BY last_seen DESC"
+                ).fetchall()
+            errors = [dict(r) for r in rows]
         else:
-            errors = _db_list(conn, status)
+            if error_type:
+                rows = conn.execute(
+                    "SELECT * FROM error_entries WHERE status = ? AND error_type = ? ORDER BY last_seen DESC",
+                    (status, error_type)
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM error_entries WHERE status = ? ORDER BY last_seen DESC",
+                    (status,)
+                ).fetchall()
+            errors = [dict(r) for r in rows]
         stats = _db_stats(conn)
         return {"ok": True, "errors": errors[:limit], "stats": stats}
     except Exception as exc:
