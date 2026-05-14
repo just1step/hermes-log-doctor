@@ -131,9 +131,15 @@
     function doAnalyze(id) {
       apiPost('/errors/' + id + '/analyze').then(function (data) {
         if (data.analysis_prompt) {
-          navigator.clipboard.writeText(data.analysis_prompt).then(function () {
-            setFlashMsg({ text: 'Analysis prompt copied! Paste to Hermes agent.', type: 'success' });
-          });
+          var ta = document.createElement('textarea');
+          ta.value = data.analysis_prompt;
+          ta.style.position = 'fixed'; ta.style.left = '-9999px';
+          document.body.appendChild(ta);
+          ta.select();
+          var copied = false;
+          try { document.execCommand('copy'); copied = true; } catch (e) {}
+          document.body.removeChild(ta);
+          setFlashMsg({ text: copied ? 'Analysis prompt copied! Paste to Hermes agent.' : 'Copy failed. Manually use: scan_hermes_logs then analyze_log_error id=' + id, type: copied ? 'success' : 'error' });
         }
       }).catch(function (e) { setFlashMsg({ text: e.message, type: 'error' }); });
     }
