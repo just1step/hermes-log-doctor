@@ -1,0 +1,4 @@
+name: log-doctor
+version: "1.0.0"
+description: Auto-scan Hermes logs for errors, diagnose root causes with agent analysis, and offer one-click fixes — with deduplication, ignore memory, and web dashboard UI
+kind: standalone

@@ -1,0 +1,14 @@
+{
+  "name": "log-doctor",
+  "label": "Log Doctor",
+  "description": "Scan Hermes logs for errors, diagnose root causes, and fix with one click — deduplication, ignore memory, and agent-powered analysis",
+  "icon": "Stethoscope",
+  "version": "1.0.0",
+  "tab": {
+    "path": "/log-doctor",
+    "position": "after:kanban"
+  },
+  "entry": "dist/index.js",
+  "css": "dist/style.css",
+  "api": "plugin_api.py"
+}
