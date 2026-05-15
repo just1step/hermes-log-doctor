@@ -220,13 +220,15 @@ def api_batch_ignore(body: BatchRequest):
 
 @router.post("/errors/batch-delete")
 def api_batch_delete(body: BatchRequest):
+    """Soft-delete errors: mark as deleted, skip in future scans.
+    Garbage-collected when log no longer contains the error."""
     conn = _get_db()
     try:
+        from db import soft_delete_error
         deleted = 0
         for eid in body.ids:
-            conn.execute("DELETE FROM error_entries WHERE id = ?", (eid,))
-            deleted += 1
-        conn.commit()
+            if soft_delete_error(conn, eid):
+                deleted += 1
         return {"ok": True, "deleted": deleted, "total": len(body.ids)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

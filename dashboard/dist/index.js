@@ -69,15 +69,22 @@
     var analysisState = _ref9[0], setAnalysisState = _ref9[1];
     var _ref10 = useState(false);
     var analysisRunning = _ref10[0], setAnalysisRunning = _ref10[1];
+    var _ref11 = useState('');
+    var searchQuery = _ref11[0], setSearchQuery = _ref11[1];
+    var _ref12 = useState([]);
+    var selectedIds = _ref12[0], setSelectedIds = _ref12[1];
+    var _ref13 = useState(0);
+    var searchTimer = _ref13[0], setSearchTimer = _ref13[1];
 
     useEffect(function () {
       loadErrors(activeTab);
-    }, [activeTab, typeFilter]);
+    }, [activeTab, typeFilter, searchQuery]);
 
     function loadErrors(tab) {
       setLoading(true);
-      var query = '/errors?status=' + (tab === 'ignored' ? 'ignored' : tab === 'fixed' ? 'fixed' : 'active');
+      var query = '/errors?status=' + (tab === 'ignored' ? 'ignored' : tab === 'fixed' ? 'fixed' : tab === 'deleted' ? 'deleted' : 'active');
       if (typeFilter) { query += '&error_type=' + typeFilter; }
+      if (searchQuery) { query += '&q=' + encodeURIComponent(searchQuery); }
       apiGet(query)
         .then(function (data) {
           setErrors(data.errors || []);
@@ -121,6 +128,27 @@
       }).catch(function (e) { setFlashMsg({ text: e.message, type: 'error' }); });
     }
 
+    function toggleSelect(id) {
+      var idx = selectedIds.indexOf(id), next = selectedIds.slice();
+      if (idx >= 0) next.splice(idx, 1); else next.push(id);
+      setSelectedIds(next);
+    }
+    function toggleSelectAll() {
+      var all = errors.map(function(e){return e.id;});
+      setSelectedIds(selectedIds.length===all.length && all.length>0 ? [] : all);
+    }
+    function doBatchIgnore() {
+      fetchJSON(API_BASE+'/errors/batch-ignore',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:selectedIds})})
+        .then(function(d){setFlashMsg({text:'Ignored '+d.ignored+' errors',type:'success'});setSelectedIds([]);loadErrors(activeTab);})
+        .catch(function(e){setFlashMsg({text:e.message,type:'error'});});
+    }
+    function doBatchDelete() {
+      if(!confirm('Delete '+selectedIds.length+' errors permanently?'))return;
+      fetchJSON(API_BASE+'/errors/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:selectedIds})})
+        .then(function(d){setFlashMsg({text:'Deleted '+d.deleted+' errors',type:'success'});setSelectedIds([]);loadErrors(activeTab);})
+        .catch(function(e){setFlashMsg({text:e.message,type:'error'});});
+    }
+
     function doFix(id) {
       apiPost('/errors/' + id + '/fix').then(function (data) {
         var fr = {};
@@ -135,8 +163,9 @@
     function doScan() {
       setLoading(true);
       apiPost('/scan', { limit: 200 }).then(function (data) {
+        setActiveTab('active');
         setFlashMsg({ text: 'Scan complete: ' + data.total_errors + ' errors (' + data.new_errors + ' new)', type: 'success' });
-        loadErrors(activeTab);
+        loadErrors('active');
       }).catch(function (e) {
         setFlashMsg({ text: 'Scan failed: ' + e.message, type: 'error' });
         setLoading(false);
@@ -285,7 +314,9 @@
         h('button', { style: activeTab === 'ignored' ? style.tabBtnActive : style.tabBtn, onClick: function () { setActiveTab('ignored'); } },
           'Ignored ', h('span', { style: style.count }, stats.ignored || 0)),
         h('button', { style: activeTab === 'fixed' ? style.tabBtnActive : style.tabBtn, onClick: function () { setActiveTab('fixed'); } },
-          'Fixed ', h('span', { style: style.count }, stats.fixed || 0))
+          'Fixed ', h('span', { style: style.count }, stats.fixed || 0)),
+        h('button', { style: activeTab === 'deleted' ? style.tabBtnActive : style.tabBtn, onClick: function () { setActiveTab('deleted'); } },
+          'Deleted ', h('span', { style: style.count }, stats.deleted || 0))
       ),
 
       h('div', { style: { display: 'flex', gap: '4px', marginBottom: '12px' } },

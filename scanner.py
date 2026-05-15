@@ -32,6 +32,8 @@ from db import (
     apply_fix as db_apply_fix,
     get_stats,
     record_scan,
+    gc_deleted_errors,
+    _error_hash,
 )
 
 log = logging.getLogger(__name__)
@@ -133,6 +135,10 @@ def _scan_log_file(log_file: Path, limit: int = 50) -> dict:
             new_errors=new_count,
             ignored_skipped=ignored_count,
         )
+
+        # GC: remove deleted entries whose errors no longer exist in logs
+        live_hashes = {_error_hash(e["source"], e["error_type"], e["message"]) for e in entries}
+        gc_count = gc_deleted_errors(conn, live_hashes)
 
         # Return active errors for agent to see
         active = list_errors(conn, "active")

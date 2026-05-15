@@ -49,6 +49,7 @@ def init_db(conn: sqlite3.Connection) -> None:
             count INTEGER DEFAULT 1,
             status TEXT DEFAULT 'active',
             ignored_at TEXT,
+            deleted_at TEXT,
             fix_description TEXT,
             fix_command TEXT,
             fix_applied_at TEXT,
@@ -69,6 +70,7 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_errors_status ON error_entries(status);
         CREATE INDEX IF NOT EXISTS idx_errors_last_seen ON error_entries(last_seen);
     """)
+    _migrate_schema(conn)
 
 
 def upsert_error(
@@ -90,7 +92,12 @@ def upsert_error(
     ).fetchone()
 
     if existing:
-        # Update count and last_seen, but respect ignored status
+        # Skip deleted entries — they stay deleted until GC'd
+        if existing["status"] == "deleted":
+            return dict(conn.execute(
+                "SELECT * FROM error_entries WHERE error_hash = ?", (h,)
+            ).fetchone())
+        # Update count and last_seen
         new_count = existing["count"] + 1
         conn.execute(
             "UPDATE error_entries SET count = ?, last_seen = ? WHERE error_hash = ?",
@@ -213,5 +220,40 @@ def get_stats(conn: sqlite3.Connection) -> dict:
         "active": active,
         "ignored": ignored,
         "fixed": fixed,
+        "deleted": conn.execute(
+            "SELECT COUNT(*) as n FROM error_entries WHERE status = 'deleted'"
+        ).fetchone()["n"],
         "last_scan": dict(last_scan) if last_scan else None,
     }
+
+
+def soft_delete_error(conn: sqlite3.Connection, error_id: int) -> bool:
+    """Mark error as deleted (soft-delete). Still kept for scan dedup."""
+    conn.execute(
+        "UPDATE error_entries SET status = 'deleted', deleted_at = ? WHERE id = ?",
+        (_now_iso(), error_id),
+    )
+    conn.commit()
+    return True
+
+
+def gc_deleted_errors(conn: sqlite3.Connection, live_hashes: set[str]) -> int:
+    """Remove deleted entries whose error no longer exists in the current log.
+    Returns count of garbage-collected entries."""
+    all_deleted = conn.execute(
+        "SELECT id, error_hash FROM error_entries WHERE status = 'deleted'"
+    ).fetchall()
+    removed = 0
+    for row in all_deleted:
+        if row["error_hash"] not in live_hashes:
+            conn.execute("DELETE FROM error_entries WHERE id = ?", (row["id"],))
+            removed += 1
+    conn.commit()
+    return removed
+
+
+# Schema migration: add deleted_at column for existing databases
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(error_entries)").fetchall()]
+    if "deleted_at" not in cols:
+        conn.execute("ALTER TABLE error_entries ADD COLUMN deleted_at TEXT")
