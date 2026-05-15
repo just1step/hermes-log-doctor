@@ -36,18 +36,16 @@ _spec_db = importlib.util.spec_from_file_location(
     "log_doctor_db", str(_PLUGIN_DIR / "db.py")
 )
 _db_mod = importlib.util.module_from_spec(_spec_db)
-sys.modules["log_doctor_db"] = _db_mod  # register before exec for inter-module refs
+sys.modules["log_doctor_db"] = _db_mod
+sys.modules["db"] = _db_mod  # for inter-module refs
 _spec_db.loader.exec_module(_db_mod)
 
-# Also make db importable for tools.py
-sys.modules["db"] = _db_mod
-
-_spec_tools = importlib.util.spec_from_file_location(
-    "log_doctor_tools", str(_PLUGIN_DIR / "tools.py")
+_spec_scanner = importlib.util.spec_from_file_location(
+    "log_doctor_scanner", str(_PLUGIN_DIR / "scanner.py")
 )
-_tools_mod = importlib.util.module_from_spec(_spec_tools)
-sys.modules["log_doctor_tools"] = _tools_mod
-_spec_tools.loader.exec_module(_tools_mod)
+_scanner_mod = importlib.util.module_from_spec(_spec_scanner)
+sys.modules["log_doctor_scanner"] = _scanner_mod
+_spec_scanner.loader.exec_module(_scanner_mod)
 
 # Unpack needed symbols
 _db_connect = _db_mod.connect
@@ -59,21 +57,17 @@ _db_unignore = _db_mod.unignore_error
 _db_set_fix = _db_mod.set_fix
 _db_apply = _db_mod.apply_fix
 _db_stats = _db_mod.get_stats
-_tools_scan = _tools_mod._scan_log_file
+_scanner_scan = _scanner_mod._scan_log_file
 
 log = logging.getLogger(__name__)
-
 router = APIRouter()
-
-_db = None
 
 
 def _get_db():
-    global _db
-    if _db is None:
-        _db = _db_connect()
-        _db_init(_db)
-    return _db
+    """Create a fresh DB connection per request (thread-safe, like Kanban)."""
+    conn = _db_connect()
+    _db_init(conn)
+    return conn
 
 
 @router.get("/entry-js")
@@ -169,7 +163,7 @@ def api_get_stats():
 def api_scan(log_file: str = "", limit: int = 200):
     log_path = Path(log_file) if log_file else DEFAULT_LOG
     try:
-        result = _tools_scan(log_path, limit=limit)
+        result = _scanner_scan(log_path, limit=limit)
         return result
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))

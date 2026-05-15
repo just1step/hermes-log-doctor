@@ -8,7 +8,7 @@ from __future__ import annotations
 
 
 def register(ctx) -> None:
-    from .tools import (
+    from .scanner import (
         handler_scan_logs,
         handler_get_errors,
         handler_analyze_error,

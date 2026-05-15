@@ -8,7 +8,7 @@
     "path": "/log-doctor",
     "position": "after:kanban"
   },
-  "entry": "dist/index.js?t=1778815668253",
+  "entry": "dist/index.js",
   "css": "dist/style.css",
   "api": "plugin_api.py"
 }

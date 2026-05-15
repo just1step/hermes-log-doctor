@@ -1,4 +1,4 @@
-"""Log Doctor — agent tool handlers.
+"""
 
 Each handler returns a JSON string (required by Hermes plugin contract).
 All handlers accept **kwargs for forward compatibility.
