@@ -292,9 +292,31 @@
         })
       ),
 
+      h('input', {
+        type: 'text', placeholder: 'Search errors...', value: searchQuery,
+        onChange: function (ev) {
+          var v = ev.target.value;
+          clearTimeout(searchTimer);
+          setSearchTimer(setTimeout(function () { setSearchQuery(v); }, 300));
+        },
+        style: { width: '100%', padding: '8px 12px', marginBottom: '12px', borderRadius: '6px', border: '1px solid #414868', background: '#1a1b26', color: '#c0caf5', fontSize: '13px', outline: 'none', boxSizing: 'border-box' }
+      }),
+
+      selectedIds.length > 0 && h('div', { style: { display: 'flex', gap: '8px', marginBottom: '12px', padding: '8px 12px', borderRadius: '6px', background: 'rgba(122,162,247,0.08)', border: '1px solid #414868', alignItems: 'center', fontSize: '13px' } },
+        h('span', { style: { color: '#c0caf5' } }, selectedIds.length + ' selected'),
+        h('button', { style: { padding: '4px 12px', border: '1px solid #e0af68', borderRadius: '4px', background: 'transparent', color: '#e0af68', cursor: 'pointer', fontSize: '12px' }, onClick: function () { doBatchIgnore(); } }, 'Ignore All'),
+        h('button', { style: { padding: '4px 12px', border: '1px solid #f7768e', borderRadius: '4px', background: 'transparent', color: '#f7768e', cursor: 'pointer', fontSize: '12px' }, onClick: function () { doBatchDelete(); } }, 'Delete All'),
+        h('button', { style: { padding: '4px 12px', border: '1px solid #414868', borderRadius: '4px', background: 'transparent', color: '#565f89', cursor: 'pointer', fontSize: '12px' }, onClick: function () { setSelectedIds([]); } }, 'Clear')
+      ),
+
       loading ? h('div', { style: style.empty }, 'Loading...') :
-      errors.length === 0 ? h('div', { style: style.empty }, 'No ' + activeTab + ' errors. \uD83C\uDF89') :
-      h('ul', { style: style.errorList },
+      errors.length === 0 ? h('div', { style: style.empty }, (searchQuery ? 'No results for "' + searchQuery + '"' : 'No ' + activeTab + ' errors. 🎉')) :
+      h('div', {},
+        h('div', { style: { display: 'flex', alignItems: 'center', padding: '4px 0 8px 0', fontSize: '12px', color: '#565f89' } },
+          h('input', { type: 'checkbox', checked: selectedIds.length === errors.length && errors.length > 0, onChange: function () { toggleSelectAll(); }, style: { cursor: 'pointer', accentColor: '#7aa2f7', width: '14px', height: '14px', marginRight: '8px' } }),
+          'Select all (' + errors.length + ')'
+        ),
+        h('ul', { style: style.errorList },
         errors.map(function (e) {
           var isExpanded = !!expanded[e.id];
           var fr = fixResults[e.id];
@@ -312,6 +334,7 @@
 
           return h('li', { key: e.id, style: style.errorItem },
             h('div', { style: style.errorHeader, onClick: function () { toggleExpand(e.id); } },
+              h('input', { type: 'checkbox', checked: selectedIds.indexOf(e.id) >= 0, onChange: function (ev) { ev.stopPropagation(); toggleSelect(e.id); }, style: { cursor: 'pointer', accentColor: '#7aa2f7', width: '14px', height: '14px', flexShrink: 0 } }),
               h('span', { style: { fontSize: '12px', color: '#565f89', transition: 'transform 0.2s', transform: isExpanded ? 'rotate(90deg)' : 'none' } }, '\u25B6'),
               h('span', { style: style.typeBadge(e.error_type) }, e.error_type),
               h('span', { style: style.msg }, e.message),
@@ -377,6 +400,7 @@
           );
         })
       )
+    )
     );
   }
 

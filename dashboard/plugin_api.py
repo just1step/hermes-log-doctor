@@ -18,6 +18,7 @@ from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
+from pydantic import BaseModel
 
 from hermes_constants import get_hermes_home
 
@@ -86,35 +87,31 @@ DEFAULT_LOG = get_hermes_home() / "logs" / "errors.log"
 def api_list_errors(
     status: str = Query("active", description="active | ignored | fixed | all"),
     error_type: str = Query("", description="Filter by type: WARNING, ERROR, CRITICAL (empty = all)"),
+    q: str = Query("", description="Search keyword (filters message field with LIKE)"),
     limit: int = Query(200, ge=1, le=1000),
 ):
     conn = _get_db()
     try:
-        type_clause = ""
-        params: list = []
-        if status == "all":
-            if error_type:
-                rows = conn.execute(
-                    "SELECT * FROM error_entries WHERE error_type = ? ORDER BY last_seen DESC",
-                    (error_type,)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM error_entries ORDER BY last_seen DESC"
-                ).fetchall()
-            errors = [dict(r) for r in rows]
-        else:
-            if error_type:
-                rows = conn.execute(
-                    "SELECT * FROM error_entries WHERE status = ? AND error_type = ? ORDER BY last_seen DESC",
-                    (status, error_type)
-                ).fetchall()
-            else:
-                rows = conn.execute(
-                    "SELECT * FROM error_entries WHERE status = ? ORDER BY last_seen DESC",
-                    (status,)
-                ).fetchall()
-            errors = [dict(r) for r in rows]
+        wheres = []
+        params = []
+
+        if status != "all":
+            wheres.append("status = ?")
+            params.append(status)
+        if error_type:
+            wheres.append("error_type = ?")
+            params.append(error_type)
+        if q:
+            wheres.append("message LIKE ?")
+            params.append(f"%{q}%")
+
+        sql = "SELECT * FROM error_entries"
+        if wheres:
+            sql += " WHERE " + " AND ".join(wheres)
+        sql += " ORDER BY last_seen DESC"
+
+        rows = conn.execute(sql, params).fetchall()
+        errors = [dict(r) for r in rows]
         stats = _db_stats(conn)
         return {"ok": True, "errors": errors[:limit], "stats": stats}
     except Exception as exc:
@@ -193,6 +190,39 @@ def api_unignore_error(error_id: int):
         return {"ok": True, "unignored": True, "error_id": error_id}
     except HTTPException:
         raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+class BatchRequest(BaseModel):
+    ids: list[int]
+
+
+@router.post("/errors/batch-ignore")
+def api_batch_ignore(body: BatchRequest):
+    conn = _get_db()
+    try:
+        ignored = 0
+        for eid in body.ids:
+            rec = _db_get(conn, eid)
+            if rec and rec.get("status") == "active":
+                _db_ignore(conn, eid)
+                ignored += 1
+        return {"ok": True, "ignored": ignored, "total": len(body.ids)}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/errors/batch-delete")
+def api_batch_delete(body: BatchRequest):
+    conn = _get_db()
+    try:
+        deleted = 0
+        for eid in body.ids:
+            conn.execute("DELETE FROM error_entries WHERE id = ?", (eid,))
+            deleted += 1
+        conn.commit()
+        return {"ok": True, "deleted": deleted, "total": len(body.ids)}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
