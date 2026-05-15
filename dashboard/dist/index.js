@@ -221,6 +221,17 @@
       return '<p style="margin:4px 0">' + h + '</p>';
     }
 
+    function formatTime(iso) {
+      if (!iso) return '';
+      // Extract HH:MM from ISO timestamp like "2026-05-14T22:00:07+08:00"
+      var m = iso.match(/T(\d{2}:\d{2})/);
+      if (m) return m[1];
+      // Fallback: try date part
+      var d = iso.match(/^(\d{4}-\d{2}-\d{2})/);
+      if (d) return d[1].slice(5) + ' ' + (iso.match(/T(\d{2}:\d{2})/) || ['', ''])[1];
+      return iso.slice(0, 16);
+    }
+
     function tabClass(name) {
       return name === activeTab ? 'tab-btn active' : 'tab-btn';
     }
@@ -332,6 +343,13 @@
           else if (isDone) statusBadge = h('span', { style: { fontSize: '10px', color: '#9ece6a', marginLeft: 'auto', flexShrink: 0 } }, '✓ analyzed');
           else if (isFailed) statusBadge = h('span', { style: { fontSize: '10px', color: '#f7768e', marginLeft: 'auto', flexShrink: 0 } }, '✗ failed');
 
+          var tsText = '';
+          if (e.count > 1) {
+            tsText = (formatTime(e.first_seen) || '?') + ' ~ ' + (formatTime(e.last_seen) || '?');
+          } else {
+            tsText = formatTime(e.first_seen) || formatTime(e.last_seen) || '';
+          }
+
           return h('li', { key: e.id, style: style.errorItem },
             h('div', { style: style.errorHeader, onClick: function () { toggleExpand(e.id); } },
               h('input', { type: 'checkbox', checked: selectedIds.indexOf(e.id) >= 0, onChange: function (ev) { ev.stopPropagation(); toggleSelect(e.id); }, style: { cursor: 'pointer', accentColor: '#7aa2f7', width: '14px', height: '14px', flexShrink: 0 } }),
@@ -339,6 +357,7 @@
               h('span', { style: style.typeBadge(e.error_type) }, e.error_type),
               h('span', { style: style.msg }, e.message),
               h('span', { style: style.countBadge }, '\u00D7' + e.count),
+              tsText && h('span', { style: { fontSize: '10px', color: '#565f89', flexShrink: 0, marginLeft: '8px' } }, tsText),
               statusBadge
             ),
             isExpanded && h('div', { style: style.detail },

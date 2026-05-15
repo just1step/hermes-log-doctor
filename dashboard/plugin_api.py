@@ -17,7 +17,7 @@ from queue import Queue
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, StreamingResponse, FileResponse
 from pydantic import BaseModel
 
 from hermes_constants import get_hermes_home
@@ -74,6 +74,17 @@ def _get_db():
         _db = _db_connect()
         _db_init(_db)
     return _db
+
+
+@router.get("/entry-js")
+def serve_entry_js():
+    """Serve index.js with no-cache headers to bust browser cache."""
+    js_path = _PLUGIN_DIR / "dashboard" / "dist" / "index.js"
+    return FileResponse(
+        js_path,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"}
+    )
 
 
 DEFAULT_LOG = get_hermes_home() / "logs" / "errors.log"
