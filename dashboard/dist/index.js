@@ -181,6 +181,13 @@
       }).catch(function (e) { setFlashMsg({ text: e.message, type: 'error' }); });
     }
 
+    function doDelete(id) {
+      if (!confirm('Delete this error permanently?')) return;
+      fetchJSON(API_BASE+'/errors/batch-delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids:[id]})})
+        .then(function(d){setFlashMsg({text:'Deleted',type:'success'});loadErrors(activeTab);})
+        .catch(function(e){setFlashMsg({text:e.message,type:'error'});});
+    }
+
     function toggleSelect(id) {
       var idx = selectedIds.indexOf(id), next = selectedIds.slice();
       if (idx >= 0) next.splice(idx, 1); else next.push(id);
@@ -399,6 +406,7 @@
       btn: { padding: '6px 14px', border: '1px solid #414868', borderRadius: '6px', background: '#24283b', color: '#c0caf5', cursor: 'pointer', fontSize: '13px' },
       btnFix: { padding: '6px 14px', border: '1px solid #9ece6a', borderRadius: '6px', background: '#24283b', color: '#9ece6a', cursor: 'pointer', fontSize: '13px' },
       btnIgnore: { padding: '6px 14px', border: '1px solid #e0af68', borderRadius: '6px', background: '#24283b', color: '#e0af68', cursor: 'pointer', fontSize: '13px' },
+      btnDelete: { padding: '6px 14px', border: '1px solid #f7768e', borderRadius: '6px', background: '#24283b', color: '#f7768e', cursor: 'pointer', fontSize: '13px' },
       empty: { textAlign: 'center', padding: '40px', color: '#565f89' },
       flash: { position: 'fixed', top: '16px', right: '16px', padding: '12px 20px', borderRadius: '8px', fontSize: '13px', zIndex: 999, animation: 'fadeIn 0.3s' },
       flashSuccess: { position: 'fixed', top: '16px', right: '16px', padding: '12px 20px', borderRadius: '8px', fontSize: '13px', zIndex: 999, background: 'rgba(158,206,106,0.2)', color: '#9ece6a', border: '1px solid #9ece6a' },
@@ -586,9 +594,11 @@
                         disabled: !(e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && !e.fix_applied_at),
                         onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doFix(e.id); }
                       }, 'Apply Fix'),
-                      // --- Ignore ---
+                      // --- Ignore / Delete ---
                       e.status === 'active' && h('button', { style: style.btnIgnore, onClick: function (ev) { ev.stopPropagation(); doIgnore(e.id); } }, 'Ignore'),
-                      e.status === 'ignored' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doUnignore(e.id); } }, 'Un-ignore')
+                      e.status === 'active' && h('button', { style: style.btnDelete, onClick: function (ev) { ev.stopPropagation(); doDelete(e.id); } }, 'Delete'),
+                      e.status === 'ignored' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doUnignore(e.id); } }, 'Un-ignore'),
+                      e.status === 'ignored' && h('button', { style: style.btnDelete, onClick: function (ev) { ev.stopPropagation(); doDelete(e.id); } }, 'Delete')
                     ),
                     fr && fr.ok && h('div', { style: style.fixOk }, 'Fix applied! Exit code: ' + fr.result.exit_code),
                     fr && !fr.ok && h('div', { style: style.fixFail }, fr.error || 'Fix failed')
