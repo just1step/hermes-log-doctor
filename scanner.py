@@ -39,11 +39,12 @@ from db import (
 log = logging.getLogger(__name__)
 
 # Regex for parsing Hermes log lines.
-# Format: 2026-05-14 22:00:07,123 WARNING [session_id] module: message
+# Format with session: 2026-05-14 22:00:07,123 WARNING [session_id] module: message
+# Format without:      2026-05-15 10:50:12,977 WARNING module: message
 LOG_PATTERN = re.compile(
     r"^(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2},\d{3})\s+"
     r"(WARNING|ERROR|CRITICAL)\s+"
-    r"\[([^\]]+)\]\s+"
+    r"(?:\[([^\]]+)\]\s+)?"
     r"(.+)$"
 )
 
@@ -105,14 +106,14 @@ def _scan_log_file(log_file: Path, limit: int = 50) -> dict:
                 "line_number": line_number,
             })
 
-    # Upsert into DB with dedup
+    # Upsert into DB with dedup — process newest entries first
     conn = connect()
     init_db(conn)
     new_count = 0
     ignored_count = 0
 
     try:
-        for entry in entries[:limit]:
+        for entry in entries[-limit:]:
             record = upsert_error(
                 conn,
                 source=entry["source"],

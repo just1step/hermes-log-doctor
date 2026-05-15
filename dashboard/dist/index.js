@@ -38,6 +38,54 @@
   }
 
   // -----------------------------------------------------------------------
+  // Sort: 10-min time buckets by last_seen, then by count desc
+  // -----------------------------------------------------------------------
+
+  function getTimeBucket(isoStr) {
+    if (!isoStr) return 0;
+    var d = new Date(isoStr);
+    var ms = d.getTime();
+    if (isNaN(ms)) return 0;
+    return Math.floor(ms / 600000) * 600000;
+  }
+
+  function formatBucketLabel(startMs) {
+    if (!startMs && startMs !== 0) return 'Unknown';
+    var d = new Date(startMs);
+    var pad = function (n) { return (n < 10 ? '0' : '') + n; };
+    var hh = pad(d.getHours());
+    var mm = pad(d.getMinutes());
+    var end = new Date(startMs + 600000);
+    var hh2 = pad(end.getHours());
+    var mm2 = pad(end.getMinutes());
+    return hh + ':' + mm + ' ~ ' + hh2 + ':' + mm2;
+  }
+
+  function groupErrorsByTimeBucket(errors) {
+    if (!errors || errors.length === 0) return [];
+    var buckets = {};
+    for (var i = 0; i < errors.length; i++) {
+      var e = errors[i];
+      var bucket = getTimeBucket(e.last_seen);
+      if (!buckets[bucket]) buckets[bucket] = [];
+      buckets[bucket].push(e);
+    }
+    // Sort bucket keys descending (newest first)
+    var keys = Object.keys(buckets).sort(function (a, b) {
+      return parseInt(b, 10) - parseInt(a, 10);
+    });
+    var result = [];
+    for (var j = 0; j < keys.length; j++) {
+      var key = parseInt(keys[j], 10);
+      var items = buckets[key];
+      // Within bucket sort by count descending
+      items.sort(function (a, b) { return b.count - a.count; });
+      result.push({ label: formatBucketLabel(key), errors: items });
+    }
+    return result;
+  }
+
+  // -----------------------------------------------------------------------
   // Main component
   // -----------------------------------------------------------------------
 
@@ -75,6 +123,11 @@
     var selectedIds = _ref12[0], setSelectedIds = _ref12[1];
     var _ref13 = useState(0);
     var searchTimer = _ref13[0], setSearchTimer = _ref13[1];
+    // Batch analysis progress
+    var _ref14 = useState(0);
+    var batchTotal = _ref14[0], setBatchTotal = _ref14[1];
+    var _ref15 = useState(0);
+    var batchDone = _ref15[0], setBatchDone = _ref15[1];
 
     useEffect(function () {
       loadErrors(activeTab);
@@ -171,11 +224,14 @@
         setLoading(false);
       });
     }
-    function doAnalyze(id) {
-      if (analysisRunning) { setFlashMsg({ text: 'Another analysis is already running. Please wait.', type: 'error' }); return; }
-      setAnalysisRunning(true);
-      setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'running', text: 'Agent starting...', fullText: 'Agent starting...' }}));
-      // Progress dots: cycle 1-5 dots, single line, no accumulation
+
+    // -----------------------------------------------------------------------
+    // Analysis: single + batch
+    // -----------------------------------------------------------------------
+
+    // Core: analyze one item, calls onDone(status) when finished
+    function _analyzeOne(id, onDone) {
+      __setAnalysisState(id, { status: 'running', text: 'Agent starting...', fullText: 'Agent starting...' });
       var dots = 0;
       var timer = setInterval(function () {
         dots = (dots % 5) + 1;
@@ -185,41 +241,97 @@
 
       apiPost('/errors/' + id + '/analyze').then(function (data) {
         if (data.analysis_started) {
-          setFlashMsg({ text: 'Agent analysis started — log-doctor-session', type: 'success' });
-          pollAnalysisResult(id, timer);
+          _pollOne(id, timer, onDone);
         } else {
           clearInterval(timer);
-          setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'failed', text: 'Failed to start' }}));
+          __setAnalysisState(id, { status: 'failed', text: 'Failed to start' });
+          if (onDone) onDone('failed');
         }
       }).catch(function (e) {
         clearInterval(timer);
         setFlashMsg({ text: e.message, type: 'error' });
-        setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'failed', text: e.message }}));
+        __setAnalysisState(id, { status: 'failed', text: e.message });
+        if (onDone) onDone('failed');
       });
     }
 
-    function pollAnalysisResult(id, timer) {
+    function _pollOne(id, timer, onDone) {
       setTimeout(function () {
         apiGet('/errors/' + id + '/analysis-status').then(function (data) {
           if (data.status === 'completed') {
             clearInterval(timer);
-            setAnalysisRunning(false);
-            setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'done', text: data.fix_description || '', fix_command: data.fix_command || '' }}));
-            setFlashMsg({ text: 'Analysis complete!', type: 'success' });
+            __setAnalysisState(id, { status: 'done', text: data.fix_description || '', fix_command: data.fix_command || '' });
             loadErrors(activeTab);
+            if (onDone) onDone('completed');
           } else if (data.status === 'failed') {
             clearInterval(timer);
-            setAnalysisRunning(false);
-            setAnalysisState(Object.assign({}, analysisState, {[id]: { status: 'failed', text: data.error || 'Unknown error' }}));
-            setFlashMsg({ text: 'Analysis failed', type: 'error' });
+            __setAnalysisState(id, { status: 'failed', text: data.error || 'Unknown error' });
+            if (onDone) onDone('failed');
           } else {
-            // Still running — poll again
-            pollAnalysisResult(id, timer);
+            _pollOne(id, timer, onDone);
           }
         }).catch(function () {
-          pollAnalysisResult(id, timer); // Retry
+          _pollOne(id, timer, onDone);
         });
       }, 2000);
+    }
+
+    // Single item: click "Ask Agent"
+    function doAnalyze(id) {
+      if (analysisRunning) { setFlashMsg({ text: 'Another analysis is already running. Please wait.', type: 'error' }); return; }
+      setAnalysisRunning(true);
+      _analyzeOne(id, function () {
+        setAnalysisRunning(false);
+      });
+    }
+
+    // Batch: analyze selected items sequentially
+    function doBatchAnalyze() {
+      // Collect selected IDs that are not already analyzed
+      var batchIds = [];
+      for (var i = 0; i < errors.length; i++) {
+        var e = errors[i];
+        if (selectedIds.indexOf(e.id) >= 0) {
+          var fd = e.fix_description || '';
+          if (!fd || fd.startsWith('__analysis_job__:')) {
+            batchIds.push(e.id);
+          }
+        }
+      }
+      if (batchIds.length === 0) {
+        setFlashMsg({ text: 'All selected errors already analyzed', type: 'error' });
+        return;
+      }
+
+      setBatchTotal(batchIds.length);
+      setBatchDone(0);
+      setAnalysisRunning(true);
+
+      var doneCount = 0;
+      function runNext() {
+        if (batchIds.length === 0) {
+          setAnalysisRunning(false);
+          setFlashMsg({ text: 'Batch complete: ' + doneCount + ' errors analyzed', type: 'success' });
+          loadErrors(activeTab);
+          return;
+        }
+        var id = batchIds.shift();
+        setBatchDone(doneCount + 1);
+        _analyzeOne(id, function (status) {
+          doneCount++;
+          setBatchDone(doneCount);
+          if (status === 'completed') {
+            // Continue to next after a brief delay
+            setTimeout(runNext, 500);
+          } else {
+            // Continue anyway — don't block the queue on a failure
+            setTimeout(runNext, 500);
+          }
+        });
+      }
+
+      // Override the dots progress to show batch count
+      runNext();
     }
 
     // Helper to get/set analysis state bypassing React batching for streaming
@@ -272,6 +384,7 @@
       tabBtn: { padding: '6px 14px', border: 'none', background: 'none', color: '#565f89', cursor: 'pointer', fontSize: '14px', borderBottom: '2px solid transparent' },
       tabBtnActive: { padding: '6px 14px', border: 'none', background: 'none', color: '#7aa2f7', cursor: 'pointer', fontSize: '14px', borderBottom: '2px solid #7aa2f7', fontWeight: 'bold' },
       count: { marginLeft: '6px', fontSize: '12px', padding: '1px 8px', borderRadius: '10px', background: '#24283b', color: '#565f89' },
+      bucketHeader: { fontSize: '13px', fontWeight: 'bold', color: '#7aa2f7', padding: '12px 0 4px 0', marginTop: '4px', borderBottom: '1px solid #2f3340' },
       errorList: { listStyle: 'none', padding: 0 },
       errorItem: { border: '1px solid #414868', borderRadius: '8px', marginBottom: '8px', background: '#24283b', overflow: 'hidden' },
       errorHeader: { display: 'flex', alignItems: 'center', padding: '12px 16px', cursor: 'pointer', gap: '12px' },
@@ -296,6 +409,21 @@
 
     // React.createElement wrapper
     var h = React.createElement;
+
+    // Compute sorted groups from errors
+    var sortedGroups = groupErrorsByTimeBucket(errors);
+
+    // Determine batch analyze button state
+    var batchHasUnanalyzed = false;
+    for (var _i = 0; _i < errors.length; _i++) {
+      if (selectedIds.indexOf(errors[_i].id) >= 0) {
+        var _fd = errors[_i].fix_description || '';
+        if (!_fd || _fd.startsWith('__analysis_job__:')) {
+          batchHasUnanalyzed = true;
+          break;
+        }
+      }
+    }
 
     return h('div', { style: style.container },
       h('h1', { style: style.h1 }, '\uD83E\uDE7A Log Doctor'),
@@ -346,111 +474,131 @@
 
       selectedIds.length > 0 && h('div', { style: { display: 'flex', gap: '8px', marginBottom: '12px', padding: '8px 12px', borderRadius: '6px', background: 'rgba(122,162,247,0.08)', border: '1px solid #414868', alignItems: 'center', fontSize: '13px' } },
         h('span', { style: { color: '#c0caf5' } }, selectedIds.length + ' selected'),
-        h('button', { style: { padding: '4px 12px', border: '1px solid #e0af68', borderRadius: '4px', background: 'transparent', color: '#e0af68', cursor: 'pointer', fontSize: '12px' }, onClick: function () { doBatchIgnore(); } }, 'Ignore All'),
-        h('button', { style: { padding: '4px 12px', border: '1px solid #f7768e', borderRadius: '4px', background: 'transparent', color: '#f7768e', cursor: 'pointer', fontSize: '12px' }, onClick: function () { doBatchDelete(); } }, 'Delete All'),
+        h('button', {
+          style: {
+            padding: '4px 12px', border: '1px solid ' + (analysisRunning || !batchHasUnanalyzed ? '#414868' : '#7aa2f7'),
+            borderRadius: '4px', background: 'transparent',
+            color: analysisRunning || !batchHasUnanalyzed ? '#565f89' : '#7aa2f7',
+            cursor: analysisRunning || !batchHasUnanalyzed ? 'not-allowed' : 'pointer', fontSize: '12px',
+            opacity: analysisRunning || !batchHasUnanalyzed ? 0.5 : 1,
+          },
+          disabled: analysisRunning || !batchHasUnanalyzed,
+          onClick: function () {
+            if (!this.disabled) doBatchAnalyze();
+          }
+        }, analysisRunning
+          ? '\u23F3 Asking Agent (' + batchDone + '/' + batchTotal + ')'
+          : '\u{1F916} Ask Agent All'),
+        h('button', { style: { padding: '4px 12px', border: '1px solid #e0af68', borderRadius: '4px', background: 'transparent', color: analysisRunning ? '#565f89' : '#e0af68', cursor: analysisRunning ? 'not-allowed' : 'pointer', fontSize: '12px', opacity: analysisRunning ? 0.4 : 1 }, disabled: analysisRunning, onClick: function () { if (!analysisRunning) doBatchIgnore(); } }, 'Ignore All'),
+        h('button', { style: { padding: '4px 12px', border: '1px solid #f7768e', borderRadius: '4px', background: 'transparent', color: analysisRunning ? '#565f89' : '#f7768e', cursor: analysisRunning ? 'not-allowed' : 'pointer', fontSize: '12px', opacity: analysisRunning ? 0.4 : 1 }, disabled: analysisRunning, onClick: function () { if (!analysisRunning) doBatchDelete(); } }, 'Delete All'),
         h('button', { style: { padding: '4px 12px', border: '1px solid #414868', borderRadius: '4px', background: 'transparent', color: '#565f89', cursor: 'pointer', fontSize: '12px' }, onClick: function () { setSelectedIds([]); } }, 'Clear')
       ),
 
       loading ? h('div', { style: style.empty }, 'Loading...') :
-      errors.length === 0 ? h('div', { style: style.empty }, (searchQuery ? 'No results for "' + searchQuery + '"' : 'No ' + activeTab + ' errors. 🎉')) :
+      errors.length === 0 ? h('div', { style: style.empty }, (searchQuery ? 'No results for "' + searchQuery + '"' : 'No ' + activeTab + ' errors. \uD83C\uDF89')) :
       h('div', {},
         h('div', { style: { display: 'flex', alignItems: 'center', padding: '4px 0 8px 0', fontSize: '12px', color: '#565f89' } },
           h('input', { type: 'checkbox', checked: selectedIds.length === errors.length && errors.length > 0, onChange: function () { toggleSelectAll(); }, style: { cursor: 'pointer', accentColor: '#7aa2f7', width: '14px', height: '14px', marginRight: '8px' } }),
           'Select all (' + errors.length + ')'
         ),
-        h('ul', { style: style.errorList },
-        errors.map(function (e) {
-          var isExpanded = !!expanded[e.id];
-          var fr = fixResults[e.id];
-          var as = analysisState[e.id];
-          var hasFix = !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:'));
-          var isRunning = as && as.status === 'running';
-          var isDone = hasFix || (as && as.status === 'done');
-          var isFailed = as && as.status === 'failed';
+        sortedGroups.map(function (group, gi) {
+          return h('div', { key: 'g' + gi },
+            h('div', { style: style.bucketHeader }, '\uD83D\uDD50 ' + group.label),
+            h('ul', { style: style.errorList },
+              group.errors.map(function (e) {
+                var isExpanded = !!expanded[e.id];
+                var fr = fixResults[e.id];
+                var as = analysisState[e.id];
+                var hasFix = !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:'));
+                var isRunning = as && as.status === 'running';
+                var isDone = hasFix || (as && as.status === 'done');
+                var isFailed = as && as.status === 'failed';
 
-          // Status badge: small colored label in header
-          var statusBadge = null;
-          if (isRunning) statusBadge = h('span', { style: { fontSize: '10px', color: '#7aa2f7', fontStyle: 'italic', marginLeft: 'auto', flexShrink: 0 } }, 'analyzing...');
-          else if (isDone) statusBadge = h('span', { style: { fontSize: '10px', color: '#9ece6a', marginLeft: 'auto', flexShrink: 0 } }, '✓ analyzed');
-          else if (isFailed) statusBadge = h('span', { style: { fontSize: '10px', color: '#f7768e', marginLeft: 'auto', flexShrink: 0 } }, '✗ failed');
+                // Status badge: small colored label in header
+                var statusBadge = null;
+                if (isRunning) statusBadge = h('span', { style: { fontSize: '10px', color: '#7aa2f7', fontStyle: 'italic', marginLeft: 'auto', flexShrink: 0 } }, 'analyzing...');
+                else if (isDone) statusBadge = h('span', { style: { fontSize: '10px', color: '#9ece6a', marginLeft: 'auto', flexShrink: 0 } }, '\u2713 analyzed');
+                else if (isFailed) statusBadge = h('span', { style: { fontSize: '10px', color: '#f7768e', marginLeft: 'auto', flexShrink: 0 } }, '\u2717 failed');
 
-          var tsText = '';
-          if (e.count > 1) {
-            tsText = (formatTime(e.first_seen) || '?') + ' ~ ' + (formatTime(e.last_seen) || '?');
-          } else {
-            tsText = formatTime(e.first_seen) || formatTime(e.last_seen) || '';
-          }
+                var tsText = '';
+                if (e.count > 1) {
+                  tsText = (formatTime(e.first_seen) || '?') + ' ~ ' + (formatTime(e.last_seen) || '?');
+                } else {
+                  tsText = formatTime(e.first_seen) || formatTime(e.last_seen) || '';
+                }
 
-          return h('li', { key: e.id, style: style.errorItem },
-            h('div', { style: style.errorHeader, onClick: function () { toggleExpand(e.id); } },
-              h('input', { type: 'checkbox', checked: selectedIds.indexOf(e.id) >= 0, onChange: function (ev) { ev.stopPropagation(); toggleSelect(e.id); }, style: { cursor: 'pointer', accentColor: '#7aa2f7', width: '14px', height: '14px', flexShrink: 0 } }),
-              h('span', { style: { fontSize: '12px', color: '#565f89', transition: 'transform 0.2s', transform: isExpanded ? 'rotate(90deg)' : 'none' } }, '\u25B6'),
-              h('span', { style: style.typeBadge(e.error_type) }, e.error_type),
-              h('span', { style: style.msg }, e.message),
-              h('span', { style: style.countBadge }, '\u00D7' + e.count),
-              tsText && h('span', { style: { fontSize: '10px', color: '#565f89', flexShrink: 0, marginLeft: '8px' } }, tsText),
-              statusBadge
-            ),
-            isExpanded && h('div', { style: style.detail },
-              h('div', { style: style.label }, 'First Seen'), h('div', { style: style.value }, e.first_seen),
-              h('div', { style: style.label }, 'Last Seen'), h('div', { style: style.value }, e.last_seen),
-              e.file_path && h('div', {}, h('div', { style: style.label }, 'File'), h('div', { style: style.value }, e.file_path + (e.line_number ? ':' + e.line_number : ''))),
-              e.context && h('div', {}, h('div', { style: style.label }, 'Raw Log'), h('pre', { style: style.pre }, e.context)),
-              (function () {
-                var resultText = hasFix ? e.fix_description : (as ? as.text : '');
-                var resultCmd = hasFix ? (e.fix_command || '') : (as ? as.fix_command || '' : '');
+                return h('li', { key: e.id, style: style.errorItem },
+                  h('div', { style: style.errorHeader, onClick: function () { toggleExpand(e.id); } },
+                    h('input', { type: 'checkbox', checked: selectedIds.indexOf(e.id) >= 0, onChange: function (ev) { ev.stopPropagation(); toggleSelect(e.id); }, style: { cursor: 'pointer', accentColor: '#7aa2f7', width: '14px', height: '14px', flexShrink: 0 } }),
+                    h('span', { style: { fontSize: '12px', color: '#565f89', transition: 'transform 0.2s', transform: isExpanded ? 'rotate(90deg)' : 'none' } }, '\u25B6'),
+                    h('span', { style: style.typeBadge(e.error_type) }, e.error_type),
+                    h('span', { style: style.msg }, e.message),
+                    h('span', { style: style.countBadge }, '\u00D7' + e.count),
+                    tsText && h('span', { style: { fontSize: '10px', color: '#565f89', flexShrink: 0, marginLeft: '8px' } }, tsText),
+                    statusBadge
+                  ),
+                  isExpanded && h('div', { style: style.detail },
+                    h('div', { style: style.label }, 'First Seen'), h('div', { style: style.value }, e.first_seen),
+                    h('div', { style: style.label }, 'Last Seen'), h('div', { style: style.value }, e.last_seen),
+                    e.file_path && h('div', {}, h('div', { style: style.label }, 'File'), h('div', { style: style.value }, e.file_path + (e.line_number ? ':' + e.line_number : ''))),
+                    e.context && h('div', {}, h('div', { style: style.label }, 'Raw Log'), h('pre', { style: style.pre }, e.context)),
+                    (function () {
+                      var resultText = hasFix ? e.fix_description : (as ? as.text : '');
+                      var resultCmd = hasFix ? (e.fix_command || '') : (as ? as.fix_command || '' : '');
 
-                // Running: live stream
-                if (isRunning) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: '#1a1b26', border: '1px solid #414868', fontSize: '12px', maxHeight: '400px', overflowY: 'auto', color: '#c0caf5' } },
-                  h('div', { style: { color: '#7aa2f7', marginBottom: '6px', fontWeight: 'bold' } }, '⏳ Agent Analysis — log-doctor-session'),
-                  h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(as.fullText || as.text) || 'Initializing...' } })
+                      // Running: live stream
+                      if (isRunning) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: '#1a1b26', border: '1px solid #414868', fontSize: '12px', maxHeight: '400px', overflowY: 'auto', color: '#c0caf5' } },
+                        h('div', { style: { color: '#7aa2f7', marginBottom: '6px', fontWeight: 'bold' } }, '\u23F3 Agent Analysis \u2014 log-doctor-session'),
+                        h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(as.fullText || as.text) || 'Initializing...' } })
+                      );
+
+                      // Done: show result
+                      if (isDone) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
+                        h('div', { style: { color: '#9ece6a', fontWeight: 'bold', marginBottom: '4px' } }, '\u2705 Agent Analysis'),
+                        h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(resultText) } }),
+                        resultCmd && h('pre', { style: style.pre }, resultCmd)
+                      );
+
+                      // Failed
+                      if (isFailed) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(247,118,142,0.1)', border: '1px solid #f7768e', color: '#f7768e', fontSize: '12px' } }, '\u274C Analysis failed: ' + (as.error || 'unknown'));
+
+                      return null;
+                    })(),
+                    h('div', { style: style.actions },
+                      // --- Ask Agent ---
+                      e.status === 'active' && h('button', {
+                        style: Object.assign({}, style.btn, (
+                          analysisRunning ? { opacity: 0.4, cursor: 'not-allowed' } :
+                          (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? { opacity: 0.4, cursor: 'not-allowed', borderColor: '#9ece6a', color: '#9ece6a' } :
+                          (analysisState[e.id] && analysisState[e.id].status === 'running') ? { opacity: 0.4, cursor: 'not-allowed' } :
+                          {}
+                        )),
+                        disabled: analysisRunning || !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || !!(analysisState[e.id] && analysisState[e.id].status === 'running'),
+                        onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doAnalyze(e.id); }
+                      }, analysisRunning ? '\u23F3 Waiting...' :
+                         (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? '\u2713 Analyzed' :
+                         (analysisState[e.id] && analysisState[e.id].status === 'running') ? 'Analyzing...' : 'Ask Agent'),
+                      // --- Apply Fix ---
+                      h('button', {
+                        style: Object.assign({}, style.btnFix, (
+                          !(e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && !e.fix_applied_at)
+                        ) ? { opacity: 0.3, cursor: 'not-allowed' } : {}),
+                        disabled: !(e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && !e.fix_applied_at),
+                        onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doFix(e.id); }
+                      }, 'Apply Fix'),
+                      // --- Ignore ---
+                      e.status === 'active' && h('button', { style: style.btnIgnore, onClick: function (ev) { ev.stopPropagation(); doIgnore(e.id); } }, 'Ignore'),
+                      e.status === 'ignored' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doUnignore(e.id); } }, 'Un-ignore')
+                    ),
+                    fr && fr.ok && h('div', { style: style.fixOk }, 'Fix applied! Exit code: ' + fr.result.exit_code),
+                    fr && !fr.ok && h('div', { style: style.fixFail }, fr.error || 'Fix failed')
+                  )
                 );
-
-                // Done: show result
-                if (isDone) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(158,206,106,0.1)', border: '1px solid #9ece6a', fontSize: '12px' } },
-                  h('div', { style: { color: '#9ece6a', fontWeight: 'bold', marginBottom: '4px' } }, '✅ Agent Analysis'),
-                  h('div', { dangerouslySetInnerHTML: { __html: mdToHtml(resultText) } }),
-                  resultCmd && h('pre', { style: style.pre }, resultCmd)
-                );
-
-                // Failed
-                if (isFailed) return h('div', { style: { padding: '8px 12px', marginBottom: '8px', borderRadius: '6px', background: 'rgba(247,118,142,0.1)', border: '1px solid #f7768e', color: '#f7768e', fontSize: '12px' } }, '❌ Analysis failed: ' + (as.error || 'unknown'));
-
-                return null;
-              })(),
-              h('div', { style: style.actions },
-                // --- Ask Agent ---
-                e.status === 'active' && h('button', {
-                  style: Object.assign({}, style.btn, (
-                    analysisRunning ? { opacity: 0.4, cursor: 'not-allowed' } :
-                    (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? { opacity: 0.4, cursor: 'not-allowed', borderColor: '#9ece6a', color: '#9ece6a' } :
-                    (analysisState[e.id] && analysisState[e.id].status === 'running') ? { opacity: 0.4, cursor: 'not-allowed' } :
-                    {}
-                  )),
-                  disabled: analysisRunning || !!(e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) || !!(analysisState[e.id] && analysisState[e.id].status === 'running'),
-                  onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doAnalyze(e.id); }
-                }, analysisRunning ? '⏳ Waiting...' :
-                   (e.fix_description && !e.fix_description.startsWith('__analysis_job__:')) ? '✓ Analyzed' :
-                   (analysisState[e.id] && analysisState[e.id].status === 'running') ? 'Analyzing...' : 'Ask Agent'),
-                // --- Apply Fix ---
-                h('button', {
-                  style: Object.assign({}, style.btnFix, (
-                    !(e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && !e.fix_applied_at)
-                  ) ? { opacity: 0.3, cursor: 'not-allowed' } : {}),
-                  disabled: !(e.fix_description && !e.fix_description.startsWith('__analysis_job__:') && !e.fix_applied_at),
-                  onClick: function (ev) { ev.stopPropagation(); if (!this.disabled) doFix(e.id); }
-                }, 'Apply Fix'),
-                // --- Ignore ---
-                e.status === 'active' && h('button', { style: style.btnIgnore, onClick: function (ev) { ev.stopPropagation(); doIgnore(e.id); } }, 'Ignore'),
-                e.status === 'ignored' && h('button', { style: style.btn, onClick: function (ev) { ev.stopPropagation(); doUnignore(e.id); } }, 'Un-ignore')
-              ),
-              fr && fr.ok && h('div', { style: style.fixOk }, 'Fix applied! Exit code: ' + fr.result.exit_code),
-              fr && !fr.ok && h('div', { style: style.fixFail }, fr.error || 'Fix failed')
+              })
             )
           );
         })
       )
-    )
     );
   }
 

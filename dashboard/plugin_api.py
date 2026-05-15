@@ -472,18 +472,19 @@ def api_analysis_status(error_id: int):
         r = dict(record)
         fd = r.get("fix_description") or ""
 
-        # Check if analysis thread is still running
-        q = _analysis_queues.get(error_id)
-        if q and not q.empty():
-            return {"ok": True, "status": "running", "error_id": error_id}
-
-        # Check if fix was stored
+        # DB first: if fix is stored, analysis is done regardless of queue state
         if fd and not fd.startswith("__analysis_job__:"):
             return {
                 "ok": True, "status": "completed", "error_id": error_id,
                 "fix_description": fd, "fix_command": r.get("fix_command") or "",
             }
 
+        # Check if analysis thread is still running
+        q = _analysis_queues.get(error_id)
+        if q and not q.empty():
+            return {"ok": True, "status": "running", "error_id": error_id}
+
+        # No fix stored and no running thread — either initial state or failed
         return {"ok": True, "status": "running", "error_id": error_id}
     except HTTPException:
         raise
